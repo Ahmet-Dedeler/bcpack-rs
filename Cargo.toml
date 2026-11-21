@@ -1,0 +1,17 @@
+[package]
+name = "bcpack-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Clean-room Xbox Series MDU BCPack texture decompressor and rANS entropy codec (BC1-BC7)"
+repository = "https://github.com/Ahmet-Dedeler/bcpack-rs"
+
+[lib]
+name = "bcpack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bcpack"
+path = "src/main.rs"
+
+[dependencies]
