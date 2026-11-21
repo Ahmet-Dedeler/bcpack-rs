@@ -1,140 +1,156 @@
-# Xbox Series X|S MDU BCPack Format & rANS Architecture Specification
+# BCPack BC1: format specification
 
-*Clean-room specification derived from public Microsoft hardware architecture disclosures (`US11234023B2`) and mathematical rANS state convergence verification (`x == L = 0x01000000`). Licensed under `MIT OR Apache-2.0`.*
+This describes the BCPack stream format for BC1 textures (codec id `0x04`) as used in retail Xbox Series texture pools, at the level needed to write a decoder. Each section states how sure we are and what the evidence is. The reference implementation is `src/` (Rust) with a readable mirror in `python/bcpack.py`.
 
----
+Status words used below:
 
-## 1. Overview & Pipeline Position
+- **exact**: taken from Microsoft's published reference RTL, or reproduced bit for bit on retail data with a check that a wrong rule fails;
+- **verified**: confirmed on retail data by a statistical check with controls (mip consistency), not bit-exact by construction;
+- **fitted**: constants estimated from retail data; mostly right, some entries uncertain or missing.
 
-**BCPack** is the fixed-function hardware entropy compressor/decompressor inside the Xbox Series X|S **Media Decompression Unit (MDU)** for DirectX block-compressed (`BC1`–`BC7`) GPU textures. In `RDS5` (`ttpf`) texture stores, chunk table entry bits `24..29` encode the codec ID as `BC_number * 4`:
+Earlier versions of this file described fitted exponential frequency tables (`lambda(q)`), a hand-derived lane read schedule and a guessed block assembly. All three were wrong and are gone. The exact tables come from the Verilog (section 3), and the read schedule falls out of the clocked lane model plus the feeder rule (section 4).
 
-| Codec ID | Format | Bytes / Block | Main Lanes (`R0..R5`) | Secondary / Index Lanes (`R6+`) |
-|---|---|---|---|---|
-| `0x04` | `BC1` (`DXGI 71/72`) | 8 B | 8 (`L0..L7`: mode, const, `R0 G0 B0 R1 G1 B1`) | 4 (`L8..L11`: 4 rows of 4x2-bit indices) |
-| `0x0C` | `BC3` (`DXGI 77/78`) | 16 B | 8 (`L0..L7`: alpha/color endpoints & modes) | 4+ (alpha & color index lanes) |
-| `0x10` | `BC4` (`DXGI 80/81`) | 8 B | 8 (`L0..L3` endpoints/ctrl + `L4..L7` 48-bit index slices) | — |
-| `0x14` | `BC5` (`DXGI 83/84`) | 16 B | 8 (`L0..L3` dual-channel endpoints/ctrl + `L4..L7` ch0 indices) | 4 (`L8..L11`: ch1 48-bit index slices) |
-| `0x18` | `BC6H` (`DXGI 95/96`) | 16 B | 8 (`L0..L7` mode/partition/endpoints) | index lanes |
-| `0x1C` | `BC7` (`DXGI 98/99`) | 16 B | 8 (`L0..L7` mode/partition/rotation/endpoints) | index lanes |
+## 1. Container
 
----
+A texture pool is an `RDS5` store. A chunk is a range of the store's virtual (unpacked) address space; one texture's mip chain can span several chunks, and one chunk can hold parts of several textures.
 
-## 2. Fragment Header Layout (`DSTATE_HDR0`..`DSTATE_HDR2`)
+| Field | Meaning |
+|---|---|
+| `0x00` | `RDS5` |
+| `0x04` u32 | n, number of chunk table entries (the last one is an end marker) |
+| `0x08` u32, `0x0C` bits 0-7 | virtual size |
+| `0x10` u32 | ETPF texture index offset / 256 |
+| `0x18` | n entries of (u32 a, u32 b) |
 
-Every rANS lane is a sequence of $g \ge 1$ **variable-size fragments** (`US11234023B2` Fig. 14 and Fig. 15d/15i). A lane does **not** have a single fixed model for an entire chunk; when a fragment exhausts its byte budget (`input_remaining == 0`) and its rANS state drains to $\le L$ while `output_remaining > 0`, the lane transitions back to `DSTATE_HDR0` (`ctrl_state <= DSTATE_HDR0`) and reads the next fragment header in-band.
+Entry i describes chunk i, which runs to entry i + 1 in both address spaces:
 
-### 2.1 Mode Byte (`hdr0`) Bitfields
+- file offset `(a & 0x3FFFFFF) << 8`
+- codec `(a >> 24) & 0x3F`: `0x00` stored, `0x20` zlib, `0x04` BC1 BCPack (`0x0C` BC3, `0x10` BC4, `0x14` BC5, `0x18` BC6H, `0x1C` BC7)
+- virtual offset `((a >> 30) | (b & 0xFFFFF) << 2) << 12`
+- `b >> 20`: zero bytes of padding at the end of the stored chunk
+
+A BC1 BCPack chunk holds `virtual_length / 8` BC1 blocks. The ETPF index (`ETPF`, count at +8, then 16-byte descriptors and 8-byte hashes) gives width, height, mip count, DXGI format, array size, tile mode and virtual start of each texture.
+
+Sources: SixNG format notes (`formats/05-ttpf.md`), paryzius' ttpf-viewer, Leonida `docs/textures.md`. Status: **exact** (the decoder's consumed byte count equals `stored length - pad` on every converged chunk of the scan in the README).
+
+## 2. Stream structure
+
+A BC1 chunk is one byte stream shared by **12 lanes**. Each lane is an independent rANS decoder that emits exactly one symbol per block:
+
+| Lane | Symbol width | Verilog `alphabet_bits` | Content |
+|---|---|---|---|
+| 0 | 8 | 7 | back-reference distance (section 5.1) |
+| 1 | 8 | 7 | unused; always 0 in retail data |
+| 2-7 | 5, 6, 5, 5, 6, 5 | 4, 5, 4, 4, 5, 4 | residuals of R0 G0 B0 R1 G1 B1 (section 5.2) |
+| 8-11 | 8 | 7 | index codebook symbols for the 2x2 quadrants TL, TR, BL, BR (section 5.4) |
+
+Every lane's symbol count (`out_target` in the Verilog) is the chunk's block count. There are no sub-streams: chunks of 1,536, 3,072 and 65,536 blocks are single streams whose lanes simply use more fragments. (Splitting a 65,536-block chunk into two 32,768-block streams, as reported for BC7, fails on 36/36 BC1 chunks.)
+
+Status: **exact**. Every lane of 15,000 chunks sampled across all 57 stores (1,024 to 131,072 blocks) emits exactly `blocks` symbols, consumes exactly its byte budget and ends in a legal state; changing a lane width, the lane count or the symbol count breaks this.
+
+## 3. One lane: the MDU rANS decoder
+
+Each lane is the `decoder` module of Microsoft's `mdu_minirans.v` (github.com/microsoft/silicon-rans, MIT license), which is also printed as FIGS. 14-15 of patent US11234023B2. The decoder here is a clock-for-clock port.
+
+**Fragments.** A lane's bytes are a sequence of fragments, each with an in-band header:
 
 ```
-  Bit 7   Bit 6 | Bit 5  |     Bit 4      | Bit 3 .. Bit 0
-+---------------+--------+----------------+----------------+
-| hdr0_z_field  |  hdr3  | flush_per_frag |  hdr0_q_field  |
-+---------------+--------+----------------+----------------+
+hdr0: bits 7:6 = z     alphabet narrowing: eab = alphabet_bits - z (clamped; eab > 8 is an error)
+      bit 5    = hdr3  1: 16-bit length follows, 0: 8-bit length
+      bit 4    = flush reset the rANS state to 0 when this fragment ends
+      bits 3:0 = q     static model 0..15
+hdr1: hdr3 = 0: payload length = hdr1 + 1
+      hdr3 = 1: payload length = (hdr2 << 8 | hdr1) + 257   (hdr2 is a third byte)
 ```
 
-- **`hdr0_z_field = hdr0[7:6]` (2 bits, `0..=3`)**: Symbol width reduction $z$. Subtracted from the lane's default `alphabet_bits` ($d$) to produce the effective alphabet bit width for the fragment:
-  $$\text{eab} = \min(9,\ d - z)$$
-  so the fragment alphabet covers $2^{\text{eab}}$ values ($0 \dots 2^{\text{eab}}-1$).
-- **`hdr3 = hdr0[5]` (1 bit)**: Extra length byte flag (`DSTATE_HDR1` / `DSTATE_HDR2` in Fig. 15i):
-  - **`hdr3 == 0` (2-byte header `[hdr0, b1]`)**:
-    $$\text{input\_remaining} = b_1 + 1 \quad (1 \dots 256\text{ bytes})$$
-    This explains why `0x1c`, `0x5c`, `0x9c`, `0xdc`, `0xdd`, `0xde` (all with bit 5 clear) use a 1-byte length field `n - 1`.
-  - **`hdr3 == 1` (3-byte header `[hdr0, b1, b2]`)**:
-    $$\text{input\_remaining} = (b_1 \mid (b_2 \ll 8)) + 257 \quad (257 \dots 65792\text{ bytes})$$
-    This explains why `0x30`–`0x3f`, `0x70`–`0x7f`, `0xb0`–`0xbf` (all with bit 5 set) use a 16-bit little-endian length offset by **`+ 257`**.
-- **`flush_per_frag = hdr0[4]` (1 bit)**: If `1`, the 32-bit rANS state register is zeroed at the end of the previous fragment and reloaded from the first 4 payload bytes (big-endian) of the new fragment. If `0`, the terminal state from the previous fragment carries over.
-- **`hdr0_q_field = hdr0[3:0]` (4 bits, `0..=15`)**: Selects one of **16 static probability models** (`current_q`).
+The payload length counts every byte the lane reads in that fragment, including the initial state bytes.
 
-### 2.2 Resolution of `0x10` "Extension Lanes"
+**State and renormalisation.** 32-bit state x, `L = 2^24`, 16-bit probabilities. A fragment starts from x = 0 (after a flush) and reads bytes `x = (x << 8 | byte) mod 2^32` while `x < L` and payload remains, so the first four bytes form the big-endian initial state. A symbol is produced when `x > L` and symbols remain. Decode step for model (eab, q):
 
-Records of the form `10 03 20 00 xx 00` (on 5-bit R/B planes) and `10 03 40 00 xx 00` (on 6-bit G planes) are **not** separate extension lanes or non-rANS parameter records:
-- `0x10` has `z = 0, hdr3 = 0, flush_per_frag = 1, q = 0` (uniform distribution) and `b1 = 0x03` (`input_remaining = 4` bytes = 0 renorm bytes).
-- Encoding **1 symbol** `sym` with uniform probability $f = 65536 / 2^{\text{eab}}$ starting from $x = L = \text{0x01000000}$ produces:
-  - 5-bit plane ($f = 2048$, $\text{cf} = 2048 \cdot \text{sym}$): $x = (2^{24} / 2048) \cdot 2^{16} + 2048 \cdot \text{sym} = \text{0x20000000} \mid (\text{sym} \ll 11)$ (`20 00 (sym<<3) 00`).
-  - 6-bit plane ($f = 1024$, $\text{cf} = 1024 \cdot \text{sym}$): $x = (2^{24} / 1024) \cdot 2^{16} + 1024 \cdot \text{sym} = \text{0x40000000} \mid (\text{sym} \ll 10)$ (`40 00 (sym<<2) 00`).
-- Decoding that 1 initial base endpoint symbol in Round 6 returns $x$ to `0x01000000 == L` with `input_remaining == 0` and `output_remaining = N - 1 > 0`.
-- Per Fig. 15j (`DSTATE_PROCESSING` / `DSTATE_DRAINING`), the lane immediately transitions to `DSTATE_HDR0` and reads its **Fragment 1 header** (e.g. `9c len ...` coding the remaining $N - 1$ delta symbols) in Round 7 in its normal lane slot.
-
----
-
-## 3. Power-of-Two Segmented Static Probability Models (`q = 0..15`)
-
-Instead of adaptive tables or per-chunk frequency headers, the MDU rANS decoder uses pre-defined lookup tables `base_table[eab][q][seg]` and `freq_table[eab][q][seg]` (`US11234023B2` Fig. 15b, 15d–15g).
-
-### 3.1 Power-of-Two Segment Partition (`seg = 0..eab`)
-
-For effective alphabet width $\text{eab} \in \{1 \dots 8\}$ ($2^{\text{eab}}$ symbols):
-- **Segment 0**: symbol `0` (`seg_start = 0`, count = $1$).
-- **Segment $k$ ($1 \le k \le \text{eab}$)**: symbols $[2^{k-1},\ 2^k - 1]$ (`seg_start = 1 << (k - 1)`, count = $2^{k-1}$).
-
-All $2^{k-1}$ symbols in segment $k$ share a uniform step frequency $f_k = \text{freq\_table}[\text{eab}][q][k]$, so cumulative frequencies are piecewise linear across power-of-two buckets:
-$$\text{fwd\_cfa}(\text{sym}) = \text{base\_table}[\text{eab}][q][k] + f_k \cdot (\text{sym} - 2^{k-1})$$
-
-### 3.2 Slot-0 Reservation (`fwd_cfa == 0`)
-
-In Fig. 15g (`1507`), symbol `0` (`fwd_cfa == 0`) is adjusted by 1 slot so that `cf = 0` is never assigned to a valid symbol:
-```verilog
-wire [15:0] fwd_cfa = fwd_base + (fwd_fa * fwd_steps);
-wire [15:0] fwd_f   = (fwd_cfa == 0) ? fwd_fa - 1 : fwd_fa;
-wire [15:0] fwd_cf  = (fwd_cfa == 0) ? 1 : fwd_cfa;
 ```
-Consequently, when all $2^{\text{eab}} - 1$ non-zero symbols hit the minimum frequency floor $f_k = 1$, symbol `0` has `fwd_fa = 65536 - (2^eab - 1)` and **`fwd_f = 65536 - 2^eab` ($M - K$ with $K = 2^{\text{eab}}$)** starting at **`fwd_cf = 1`**. This directly produces all confirmed constant-lane parameters:
-- `0xdb` ($\text{eab} = 1, q = 11$): $K = 2^1 = 2$, $f = 65534$
-- `0xdc` ($\text{eab} = 2, q = 12$): $K = 2^2 = 4$, $f = 65532$
-- `0xdd` ($\text{eab} = 3, q = 13$): $K = 2^3 = 8$, $f = 65528$
-- `0x5e` ($\text{eab} = 4, q = 14$): $K = 2^4 = 16$, $f = 65520$
-- `0xde` / `0x1e` ($\text{eab} = 5, q = 14$): $K = 2^5 = 32$, $f = 65504$
-- `0x1f` on 6-bit ($\text{eab} = 6, q = 15$): $K = 2^6 = 64$, $f = 65472$
-- `0x1f` on 8-bit ($\text{eab} = 8, q = 15$): $K = 2^8 = 256$, $f = 65280$
+cf  = x & 0xFFFF
+s   = inverse(cf)                         # comparator chain + reciprocal multiply
+f, c = forward(s)
+x   = f * (x >> 16) + cf - c   (mod 2^32)
+```
 
-### 3.3 Recovered Model Decay Schedule $\lambda(q)$ (`q = 0..15`)
+**Models.** For alphabet index `eab` (alphabet of eab + 1 bits) and model q, symbols are grouped in segments: segment 0 is symbol 0, segment k >= 1 is symbols [2^(k-1), 2^k). Each segment has a base (cumulative frequency) and a per-symbol frequency; slot 0 is reserved, so a symbol whose cumulative frequency would be 0 gets `(f - 1, 1)`. The inverse uses the Verilog's reciprocal path `steps = ((cf - base + rn) * rf >> 15) >> rs`. All five tables (`base`, `freq`, `rf`, `rs`, `rn`, 9 x 16 x 10 each) are generated from the Verilog source by `tools/gen_tables.py` into `src/tables.rs` and `python/bcpack_tables.py`, with a SHA-256 checked by both test suites. A unit test checks that the reciprocal inverse equals exact division for every cf of every model.
 
-Each model $q \in \{0 \dots 15\}$ is a truncated exponential CDF on $[0, 1]$, $\text{CDF}(t) = \frac{1 - e^{-\lambda_q t}}{1 - e^{-\lambda_q}}$, quantized backwards from $k = \text{eab}$ down to $0$ with minimum frequency floor $1$:
+**End of a fragment.** When the payload is exhausted: if x = L, the next fragment header follows; otherwise the lane drains (keeps emitting without reading) until x <= L. **End of the lane**: after its last symbol a lane's state must be `L`, `L >> 8` or `L >> 16` (the encoder may drop up to two trailing zero bytes). Anything else is an error.
 
-| Model $q$ | $\lambda_q$ | Exact Solved Example `freq_table[eab][q]` |
-|---|---|---|
-| `0` | `0.000000` | Uniform: $f_k = 65536 / 2^{\text{eab}}$ |
-| `1` | `0.739926` | `eab=2`: `[21168, 17592, 13388]` · `eab=4`: `[5665, 5407, 5048, 4398, 3347]` |
-| `2` | `1.496350` | `eab=2`: `[26354, 18130, 10526]` · `eab=3`: `[14406, 11948, 9065, 5263]` · `eab=4`: `[7539, 6867, 5975, 4531, 2632]` |
-| `3` | `2.307231` | `eab=2`: `[31900, 17918, 7859]` |
-| `4` | `3.221322` | `eab=3`: `[22624, 15126, 8437, 2728]` |
-| `5` | `4.307485` | `eab=2`: `[43800, 14920, 3408]` |
-| `6` | `5.676284` | `eab=3`: `[33414, 16436, 6031, 906]` |
-| `7` | `7.508501` | `eab=4`: `[24559, 15361, 7808, 2124, 188]` |
-| `8` | `10.112494` | `eab=2`: `[60308, 4812, 208]` |
-| `9` | `14.036894` | `eab=2`: `[63575, 1901, 30]` |
-| `10` | `20.348947` | `eab=3`: `[60388, 4744, 200, 1]` |
-| `11` | `31.445855` | `eab=3`: `[64250, 1262, 10, 1]` · `eab=8`: `[7575, 6701, 5582, 3892, 1918, 494, 34, 1, 1]` |
-| `12` | `53.681684` | `eab=4`: `[63248, 2208, 34, 1, 1]` · `eab=5`: `[53291, 9957, 1104, 14, 1, 1]` |
-| `13` | `109.260000` | `eab=5`: `[63380, 2084, 22, 1, 1, 1]` · `eab=6`: `[53649, 9731, 1042, 4, 1, 1, 1]` |
-| `14` | `328.115610` | `eab=6`: `[65147, 327, 1, 1, 1, 1, 1]` · `eab<=5`: constant ($K = 2^{\text{eab}}$) |
-| `15` | $\infty$ | All $\text{eab} \in \{1 \dots 8\}$: $[65536 - (2^{\text{eab}} - 1),\ 1,\ 1,\ \dots,\ 1]$ |
+Status: **exact** (Microsoft RTL). The retail check: under these tables every lane of every sampled chunk converges; under the earlier fitted `lambda(q)` tables 0/120.
 
-### 3.4 Early-Trimming Legal End States (`legal_end_state`)
+## 4. Lanes sharing one stream: feeder and lockstep
 
-In Fig. 15g (`1507`), the hardware decoder accepts three terminal states at the end of a fragment (`// we can terminate slightly early due to trimming in the compressor`):
-$$\text{legal\_end\_state} \in \{L,\ L \gg 8,\ L \gg 16\} = \{\text{0x01000000},\ \text{0x00010000},\ \text{0x00000100}\}$$
-When an encoder begins a fragment with a single $f = 1$ exception symbol starting from the trimmed initial state $x = L \gg 16 = \text{0x100}$, no renorm bytes are emitted ($0x100 < ((L \gg 16) \ll 8) \cdot 1 = 0x10000$) and the state transitions directly to $x = \text{0x01000000} + \text{cf}$.
+The published Verilog has one lane. How 12 lanes share one stream was established on retail data:
 
----
+1. **Clocking.** Each clock has two phases. Phase 0: a lane that holds a decoded symbol hands it to its output slot and applies the state update; lanes that want a byte request one. Phase 1: header state machine, renormalisation and symbol decode. (`src/rans.rs` has the exact per-phase rules, ported from the Verilog's `always` blocks, including stall conditions.)
+2. **Feeder.** In phase 0, the lanes requesting a byte are served in lane order 0, 1, ..., 11 from the single stream, **at most 8 bytes per clock** (`MDU_RANS_FEED_WINDOW = 8`). A lane that requests and is not served stalls for that clock.
+3. **Lockstep output.** Each lane has one output slot and may only hand over a symbol while its slot is empty. The 12 slots are released together once every lane that is still active holds a symbol. So symbol vectors leave one block at a time.
 
-## 4. Two-Phase Multi-Lane Feeder & Lockstep `symvec` Schedule
+Nothing else is needed: the column-interleaved 48-byte header, the "round 6/7" behaviour and the demand-driven refills that earlier work described all follow from these rules.
 
-1. **Rounds 0..5 (48-byte main header)**: Main lanes `L0..L7` launch at Round 0 (`DSTATE_HDR0`) and read 1 byte per lane per round for 6 rounds (48 bytes total, column-interleaved).
-   - Lanes with `hdr3 == 0` read 2 header bytes (`R0..R1`) + 4 initial state bytes (`R2..R5`).
-   - Lanes with `hdr3 == 1` read 3 header bytes (`R0..R2`) + 3 initial state bytes (`R3..R5`).
-2. **Round 6 (index lane launch & 1-symbol base drain)**:
-   - Any `L0..L7` lane with `hdr3 == 1` reads its 4th initial state byte; any `L0..L7` lane with `hdr3 == 0` and `payload_bytes > 4` reads its 1-byte prefetch (`input_buf`).
-   - Any `L2..L7` lane whose Fragment 0 is a 1-symbol uniform base value (`0x10 / 0x50 / 0x90 / 0xd0`, `payload_bytes == 4`) drains that 1 symbol to $x = L$ and transitions to `DSTATE_HDR0` at the end of Round 6.
-   - Index lanes `L8..L11` launch at Round 6 (`DSTATE_HDR0`) and read their `HDR0` byte.
-3. **Rounds 7..12 (header/state alignment barrier)**:
-   - `L2..L7` Fragment 1 (`hdr3 == 0`: 2 header bytes in `R7..R8` + 4 state bytes in `R9..R12`) and `L8..L11` Fragment 0 (`hdr3 == 1`: `HDR1` in `R7`, `HDR2` in `R8` + 4 state bytes in `R9..R12`) finish loading their 4th initial state byte on the **exact same cycle (Round 12 `PHASE 1`)** and load their prefetch byte in **Round 13 (`PHASE 0`)**.
-   - While any active lane is still in `HDR0..HDR2` or loading its initial 4 state bytes, lanes that already have a valid symbol in `sym_buf` stall on output (`blocked_on_output = sym_buf_full && !sym_ready`).
+Status: **exact**. 15,000/15,000 sampled chunks converge on all 12 lanes; 0/120 converge when any one rule changes (window 7, 9 or 16; serving lanes in reverse order; serving index lanes first; letting lanes run free instead of lockstep; block count +-1).
 
----
+## 5. BC1 semantics
 
-## 5. Empirical Validation on Real Corpus
+Blocks are produced in stream order, i = 0 .. blocks - 1.
 
-Tested across **3,674 real BC1 chunks** (`7,162` self-contained `len == 4` fragments spanning `q = 0..15` and `eab = 1..8`) in `ttdb_graphics.ttpf`, `ttdb_interiors_0_3.ttpf`, and `ttdb_maps_0_7.ttpf`, plus **100,020 BC1 chunks** scanned across all 46 `ttdb` stores:
-- **`len == 4` fragment convergence (`x in {L, L>>8, L>>16}`)**: **`7,162 / 7,162` (`100.00%`)** across all observed models (`q = 0`: `981/981`, `q = 1`: `2/2`, `q = 9`: `1/1`, `q = 10`: `1/1`, `q = 12`: `3139/3139`, `q = 13`: `574/574`, `q = 14`: `2416/2416`, `q = 15`: `48/48`).
-- **Byte-budget conservation on multi-fragment 4,096-block BC1 chunks** (e.g., `ttdb_interiors_1_3.ttpf` chunk 2574, `clen = 19,512` bytes): sum of parsed headers and fragment byte budgets across `L0..L11` (including `L4` and `L7` Fragment 0 `0x10` + Fragment 1 `0x9c`/`0x9b` transitions) equals **`19,512 / 19,512` bytes** to the exact byte.
+### 5.1 Lane 0: back reference
+
+```
+d = (v >> 1)          if v is even        # 0, 1, 2, ... 127
+    255 - (v >> 1)    if v is odd         # 255, 254, ... 128
+```
+
+i.e. `d = unzigzag(v) mod 256`. d = 0 means "no reference" (predict zero). Otherwise the prediction P is the six endpoint fields of block `i - d`.
+
+### 5.2 Lanes 2-7: endpoint residuals
+
+```
+r = -(s + 1) / 2   if s is odd,  s / 2 if s is even        # zigzag 0, -1, +1, -2, +2, ...
+field[k] = (P[k] + r) mod 2^width[k]                       # widths 5 6 5 5 6 5
+c0 = R0 << 11 | G0 << 5 | B0      c1 = R1 << 11 | G1 << 5 | B1
+```
+
+Fields never mix (endpoint 1 is predicted from the reference's endpoint 1). There is no swap flag: c0 <= c1 (3-colour mode) occurs and is written as decoded.
+
+Status: **verified**. On textures without references before block 0, the decoded endpoints lie on the plain mip 1 colours at control level (median segment distance 0.4 vs 0.8 for true BC1 endpoints; 8/8 textures); every other predictor and residual map tested scores at chance.
+
+### 5.3 References before block 0: the preset window
+
+When d > i the reference points before the chunk. It reads slot `(i - d) mod 256` of a **fixed 256-entry table of endpoint fields**, the same for every chunk. The table is not in the stream. The decoder loads it from `data/bc1_window.json`, where each slot is `[R0, G0, B0, R1, G1, B1]` or `null` (not fitted yet; decoded as zeros, and the decoder reports how many blocks depend on such slots).
+
+Status: **fitted**. The values were fitted against mip consistency. Slot 242's single value fits 100/100 textures that use it; overall 548 of 563 (texture, slot) cases agree with one value per slot. The fitted slots are the most used ones, but references reach most of the 256 slots, so many textures still touch an unfitted slot (see the README for current coverage). The entries look like a trained codebook of common endpoint pairs and follow no formula of the slot index.
+
+### 5.4 Lanes 8-11: index quadrants
+
+Lane 8 covers pixels (0..1, 0..1) of the block, lane 9 (2..3, 0..1), lane 10 (0..1, 2..3), lane 11 (2..3, 2..3). Each symbol indexes a **fixed 256-entry codebook** of 2x2 patterns of BC1 2-bit codes, given in the order TL, TR, BL, BR of the 2x2 group. The table is a bijection onto all 4^4 patterns, ordered roughly by frequency. The index word puts pixel (x, y) at bits `2 * (4y + x)`:
+
+```
+index = 0
+for quadrant q in (TL, TR, BL, BR) with origin (ox, oy) in ((0,0), (2,0), (0,2), (2,2)):
+    codes = CODEBOOK[lane[8 + q][i]]                 # [tl, tr, bl, br]
+    for k, (dx, dy) in enumerate(((0,0), (1,0), (0,1), (1,1))):
+        index |= codes[k] << 2 * (4 * (oy + dy) + ox + dx)
+```
+
+Symbols 0-3 are the uniform quadrants with code `sym ^ 2` (0 = all code 2, 1 = all code 3, 2 = all c0, 3 = all c1). Index lanes are not predicted from the referenced block.
+
+The codebook is `data/bc1_quad_table.json`. Status: **fitted**; symbols 0-3 measured exactly. Fits on disjoint halves of the stores agree on 248/256 entries (99.76% of quadrant occurrences); the 8 that differ are 4 rare mirror pairs (229/235, 230/231, 247/248, 254/255). Held-out decodes score 36.1-36.6 dB median against the plain mip 1, against a 37.9 dB ceiling for plain BC1.
+
+### 5.5 Block order
+
+Stream order is the texture's stored order, i.e. the AMD Gfx10 tiled order (64 KiB `SW_64KB_D` tiles for tile mode 0, 4 KiB `SW_4KB_S` otherwise; in-tile bit order for 8-byte elements `x0 y0 x1 x2 y1 y2 x3 y3 x4 y4 x5 y5 x6` and `x0 y0 y1 x1 x2 y2 x3 y3 x4`). The decoded chunk can replace the BCPack chunk's virtual bytes directly; detiling is the same as for zlib chunks (`src/ttpf.rs`, a port of ttpf-viewer).
+
+Status: **verified** (Gfx10 order beats row-major in 3,243/3,244 textures on a quadrant-consistency statistic).
+
+## 6. What is not known
+
+- The rest of the preset window (section 5.3) and the 4 uncertain codebook pairs (5.4).
+- 3-colour blocks (c0 <= c1) fit mip 1 worse than 4-colour blocks; no separate table was found.
+- Other codecs. BC7 uses 16 lanes (widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`) under the same entropy layer; its block semantics are open. BC3/4/5/6H are not started.
+
+## 7. Encoding
+
+The hardware encoder is not public. `src/encode.rs` builds valid streams for tests: each lane is split into flushed fragments, each encoded as a reverse rANS stream from state L, and the per-lane streams are interleaved by running the decoder with per-lane byte queues and recording which lane takes each byte. That works because the feeder only looks at lane states.
