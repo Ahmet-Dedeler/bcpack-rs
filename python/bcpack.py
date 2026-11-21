@@ -1,558 +1,451 @@
-"""Clean-room Xbox Series X|S MDU BCPack rANS entropy codec and BC1-BC7 stream decoder.
+#!/usr/bin/env python3
+"""Reference decoder for Xbox Series BCPack BC1 chunks (pure Python, stdlib only).
 
-Runs under `python -I` using only the Python standard library.
-Licensed under MIT OR Apache-2.0. Zero game data included.
+This is the readable mirror of the Rust decoder in ../src. It is slow (about
+0.1-0.3 MB/s) and exists to pin down the format and to cross-check the Rust
+code byte for byte. Run under `python3 -I`.
+
+    python3 -I python/bcpack.py decode-bc1 CHUNK.bin BLOCKS OUT.bc1
+    python3 -I python/bcpack.py symbols CHUNK.bin BLOCKS        # 12 lane symbol lists
+    python3 -I python/bcpack.py selftest
+
+Layers (docs/BCPACK_SPEC.md has the evidence for each):
+  1. Entropy: 12 rANS lanes, each a cycle-level port of the `decoder` module in
+     Microsoft's MIT-licensed silicon-rans Verilog (mdu_minirans.v), with its
+     exact model tables (bcpack_tables.py, generated). Lanes share one byte stream:
+     each clock the lanes that request a byte are served in lane order 0..11,
+     at most 8 bytes per clock. Symbols leave in lockstep vectors (one per lane).
+  2. Endpoints: lane 0 = back-reference distance into the last 256 blocks
+     (refs before block 0 read a fixed preset window), lanes 2-7 = zigzag
+     residuals of R0 G0 B0 R1 G1 B1 modulo 2^width.
+  3. Indices: lanes 8-11 = 2x2 quadrants TL, TR, BL, BR; each symbol indexes
+     a fixed 256-entry codebook of 2x2 patterns of BC1 2-bit codes.
+  4. Output: BC1 blocks in stream order, which is the stored Gfx10 tile order.
+
+Licensed MIT OR Apache-2.0. Tables: MIT, Copyright (c) Microsoft Corporation.
 """
 from __future__ import annotations
 
-import argparse
-import math
+import json
+import os
 import struct
 import sys
-import unittest
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
 
-RANS_M = 1 << 16
-RANS_L = 1 << 24
-LEGAL_END_STATES = (RANS_L, RANS_L >> 8, RANS_L >> 16)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from bcpack_tables import BASE_TABLE, FREQ_TABLE, RF_TABLE, RN_TABLE, RS_TABLE, TABLES_SHA256  # noqa: E402
 
-MODEL_LAMBDAS: Tuple[float, ...] = (
-    0.0,        # q = 0 (uniform)
-    0.739926,   # q = 1
-    1.496350,   # q = 2
-    2.307231,   # q = 3
-    3.221322,   # q = 4
-    4.307485,   # q = 5
-    5.676284,   # q = 6
-    7.508501,   # q = 7
-    10.112494,  # q = 8
-    14.036894,  # q = 9
-    20.348947,  # q = 10
-    31.445855,  # q = 11
-    53.681684,  # q = 12
-    109.260000, # q = 13
-    328.115610, # q = 14
-    1.0e9,      # q = 15 (all non-zero symbols frequency 1)
-)
+DATA = os.path.join(os.path.dirname(HERE), "data")
 
-EXACT_TABLES: Dict[Tuple[int, int], Tuple[int, ...]] = {
-    (2, 1): (21168, 17592, 13388),
-    (4, 1): (5665, 5407, 5048, 4398, 3347),
-    (2, 2): (26354, 18130, 10526),
-    (3, 2): (14406, 11948, 9065, 5263),
-    (4, 2): (7539, 6867, 5975, 4531, 2632),
-    (2, 3): (31900, 17918, 7859),
-    (3, 4): (22624, 15126, 8437, 2728),
-    (2, 5): (43800, 14920, 3408),
-    (3, 6): (33414, 16436, 6031, 906),
-    (4, 7): (24559, 15361, 7808, 2124, 188),
-    (2, 8): (60308, 4812, 208),
-    (2, 9): (63575, 1901, 30),
-    (3, 10): (60388, 4744, 200, 1),
-    (3, 11): (64250, 1262, 10, 1),
-    (8, 11): (7575, 6701, 5582, 3892, 1918, 494, 34, 1, 1),
-    (3, 12): (65456, 74, 1, 1),
-    (4, 12): (63248, 2208, 34, 1, 1),
-    (5, 12): (53291, 9957, 1104, 14, 1, 1),
-    (5, 13): (63380, 2084, 22, 1, 1, 1),
-    (6, 13): (53649, 9731, 1042, 4, 1, 1, 1),
-    (6, 14): (65147, 327, 1, 1, 1, 1, 1),
-}
+L = 1 << 24
+LEGAL = (L, L >> 8, L >> 16)
+FEED_WINDOW = 8
 
-BC1_LANE_AB: Tuple[int, ...] = (8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8)
-BC4_LANE_AB: Tuple[int, ...] = (8, 4, 8, 8, 8, 8, 8, 8)
-BC5_LANE_AB: Tuple[int, ...] = (8, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8)
+# BC1 lane layout: alphabet_bits = symbol width - 1 (the Verilog `alphabet_bits` input)
+BC1_ALPHABET_BITS = (7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7)
+BC1_ENDPOINT_WIDTHS = (5, 6, 5, 5, 6, 5)   # lanes 2..7 = R0 G0 B0 R1 G1 B1
+
+IDLE, HDR0, HDR1, HDR2, PROC, DRAIN = range(6)
 
 
-def is_legal_end_state(x: int) -> bool:
-    return x in LEGAL_END_STATES
+class BCPackError(Exception):
+    pass
 
 
-@dataclass(frozen=True)
-class FragmentHeader:
-    raw_mode: int
-    z_adjust: int
-    hdr3: bool
-    flush_per_frag: bool
-    model_q: int
-    payload_bytes: int
-    header_bytes: int
+# ---------------------------------------------------------------------------
+# Model (mdu_minirans.v inverse / forward paths)
+# ---------------------------------------------------------------------------
+class Model:
+    def __init__(self, eab, q):
+        self.eab, self.q = eab, q
+        self.base = BASE_TABLE[eab][q]
+        self.freq = FREQ_TABLE[eab][q]
+        self.rf = RF_TABLE[eab][q]
+        self.rs = RS_TABLE[eab][q]
+        self.rn = RN_TABLE[eab][q]
+        self.nseg = eab + 2           # segment k is enabled iff eab >= k - 1
 
-    @staticmethod
-    def parse_mode_byte(b0: int) -> Tuple[int, bool, bool, int]:
-        z = (b0 >> 6) & 0x03
-        hdr3 = bool((b0 >> 5) & 0x01)
-        flush = bool((b0 >> 4) & 0x01)
-        q = b0 & 0x0F
-        return z, hdr3, flush, q
-
-    @classmethod
-    def from_bytes(cls, b0: int, b1: int, b2: Optional[int] = None) -> "FragmentHeader":
-        z, hdr3, flush, q = cls.parse_mode_byte(b0)
-        if hdr3:
-            if b2 is None:
-                raise ValueError("hdr3 fragment requires 3rd header byte")
-            length = (b1 | (b2 << 8)) + 257
-            return cls(b0, z, True, flush, q, length, 3)
-        return cls(b0, z, False, flush, q, b1 + 1, 2)
-
-    @staticmethod
-    def encode_header(z_adjust: int, flush_per_frag: bool, model_q: int, payload_bytes: int) -> bytes:
-        if not (1 <= payload_bytes <= 65792):
-            raise ValueError(f"invalid payload_bytes: {payload_bytes}")
-        hdr3 = payload_bytes > 256
-        b0 = ((z_adjust & 3) << 6) | ((1 if hdr3 else 0) << 5) | ((1 if flush_per_frag else 0) << 4) | (model_q & 0x0F)
-        if hdr3:
-            v = payload_bytes - 257
-            return bytes((b0, v & 0xFF, (v >> 8) & 0xFF))
-        return bytes((b0, payload_bytes - 1))
-
-
-@dataclass(frozen=True)
-class ProbabilityModel:
-    eab: int
-    q: int
-    freqs: Tuple[int, ...]
-    bases: Tuple[int, ...]
-
-    @classmethod
-    def create(cls, eab: int, q: int) -> "ProbabilityModel":
-        eab = max(1, min(8, eab))
-        q = q & 0x0F
-        counts = [1] + [1 << (k - 1) for k in range(1, eab + 1)]
-        if q == 0:
-            f = RANS_M >> eab
-            freqs = [f] * (eab + 1)
-        elif (
-            q == 15
-            or (eab == 1 and q >= 11)
-            or (eab == 2 and q >= 12)
-            or (eab == 3 and q >= 13)
-            or (eab in (4, 5) and q >= 14)
-        ):
-            freqs = [RANS_M - ((1 << eab) - 1)] + [1] * eab
-        elif (eab, q) in EXACT_TABLES:
-            freqs = list(EXACT_TABLES[(eab, q)])
-        else:
-            lam = MODEL_LAMBDAS[q]
-            n_syms = float(1 << eab)
-            denom = 1.0 - math.exp(-lam)
-            raw_b = [0.0]
-            for k in range(1, eab + 1):
-                t = float(1 << (k - 1)) / n_syms
-                cdf = (1.0 - math.exp(-lam * t)) / denom
-                raw_b.append(cdf * 65536.0)
-            act_top = 65536
-            freqs = [0] * (eab + 1)
-            for k in range(eab, 0, -1):
-                c = counts[k]
-                f = max(1, int(round((act_top - raw_b[k]) / c)))
-                freqs[k] = f
-                act_top -= f * c
-            freqs[0] = max(2, act_top)
-
-        bases = []
-        acc = 0
-        for f, c in zip(freqs, counts):
-            bases.append(acc)
-            acc += f * c
-        assert acc == RANS_M, f"model sum mismatch: {acc}"
-        return cls(eab, q, tuple(freqs), tuple(bases))
-
-    def forward_params(self, sym: int) -> Tuple[int, int]:
-        if sym == 0:
-            return self.freqs[0] - 1, 1
-        seg = sym.bit_length()
-        step = sym - (1 << (seg - 1))
-        fa = self.freqs[seg]
-        return fa, self.bases[seg] + fa * step
-
-    def inverse_lookup(self, cf_in: int) -> Tuple[int, int, int]:
-        if cf_in <= 0:
-            raise ValueError("invalid rANS slot 0")
+    def inverse(self, cf):
+        """Symbol for the low 16 state bits: comparator chain, then reciprocal divide."""
+        b = self.base
         seg = 0
-        for k in range(len(self.bases) - 1, -1, -1):
-            if cf_in >= self.bases[k]:
+        for k in range(self.nseg - 1, 0, -1):
+            if cf >= b[k]:
                 seg = k
                 break
-        if seg == 0:
-            return 0, self.freqs[0] - 1, 1
-        b = self.bases[seg]
-        fa = self.freqs[seg]
-        step = (cf_in - b) // fa
-        sym = (1 << (seg - 1)) + step
-        return sym, fa, b + step * fa
+        base_x = 0 if seg == 0 else 1 << (seg - 1)
+        dist = ((cf - b[seg]) + self.rn[seg]) & 0xFFFF
+        steps = (((dist * self.rf[seg]) & 0xFFFFFFFF) >> 15 >> self.rs[seg]) & 0x1FF
+        return (base_x + steps) & 0x1FF
 
-    def encode_fragment(self, symbols: Sequence[int]) -> bytes:
-        x = RANS_L
-        renorm_rev = bytearray()
-        for sym in reversed(symbols):
-            f, cf = self.forward_params(sym)
-            max_x = ((RANS_L >> 16) << 8) * f
-            while x >= max_x:
-                renorm_rev.append(x & 0xFF)
-                x >>= 8
-            x = ((x // f) << 16) + (x % f) + cf
-        renorm_rev.reverse()
-        return struct.pack(">I", x) + bytes(renorm_rev)
-
-    def decode_fragment(self, payload: bytes, max_symbols: int = 65536) -> Tuple[List[int], int]:
-        if len(payload) < 4:
-            raise ValueError("payload shorter than 4 bytes")
-        x = struct.unpack_from(">I", payload, 0)[0]
-        pos = 4
-        out: List[int] = []
-        while len(out) < max_symbols:
-            while x < RANS_L and pos < len(payload):
-                x = ((x & 0xFFFFFF) << 8) | payload[pos]
-                pos += 1
-            if pos == len(payload) and is_legal_end_state(x):
-                return out, x
-            if x < RANS_L:
-                raise ValueError("payload underflow before legal end state")
-            cf_in = x & 0xFFFF
-            sym, fwd_f, fwd_cf = self.inverse_lookup(cf_in)
-            out.append(sym)
-            x = fwd_f * (x >> 16) + cf_in - fwd_cf
-        while x < RANS_L and pos < len(payload):
-            x = ((x & 0xFFFFFF) << 8) | payload[pos]
-            pos += 1
-        if pos == len(payload) and is_legal_end_state(x):
-            return out, x
-        raise ValueError("fragment did not converge within max_symbols")
+    def forward(self, sym):
+        """(freq, cumulative freq) of sym; slot 0 is reserved (cf 0 -> f-1, 1)."""
+        seg = sym.bit_length()
+        st = 0 if seg == 0 else 1 << (seg - 1)
+        fa = self.freq[seg]
+        cfa = (self.base[seg] + fa * (sym - st)) & 0xFFFF
+        if cfa == 0:
+            return (fa - 1) & 0xFFFF, 1
+        return fa, cfa
 
 
-_MODEL_CACHE: Dict[Tuple[int, int], ProbabilityModel] = {
-    (eab, q): ProbabilityModel.create(eab, q) for eab in range(1, 9) for q in range(16)
-}
+_MODELS = {}
 
 
-def get_model(eab: int, q: int) -> ProbabilityModel:
-    return _MODEL_CACHE[(max(1, min(8, eab)), q & 0x0F)]
+def model(eab, q):
+    m = _MODELS.get((eab, q))
+    if m is None:
+        m = _MODELS[(eab, q)] = Model(eab, q)
+    return m
 
 
-IDLE, HDR0, HDR1, HDR2, PROC, DRAIN = 0, 1, 2, 3, 4, 5
+# ---------------------------------------------------------------------------
+# Cycle-level multi-lane decoder
+# ---------------------------------------------------------------------------
+class Lane:
+    __slots__ = ("idx", "ab", "target", "state", "ib", "ib_full", "sym", "sym_full", "in_rem",
+                 "out_rem", "p0", "p1", "hdr3", "flush", "q", "eab", "model", "done", "go",
+                 "stall", "syms", "nbytes", "final", "frags")
 
-
-@dataclass
-class RansLane:
-    lane_index: int
-    alphabet_bits: int
-    output_remaining: int
-    ctrl_state: int = IDLE
-    input_buf: int = 0
-    input_buf_full: bool = False
-    sym_buf: int = 0
-    sym_buf_full: bool = False
-    input_remaining: int = 0
-    rans_state_p0: int = 0
-    rans_state_p1: int = 0
-    hdr3: bool = False
-    flush_per_frag: bool = False
-    eab: int = 8
-    current_q: int = 0
-    model: ProbabilityModel = field(default_factory=lambda: get_model(8, 0))
-    done: bool = False
-    decoded_symbols: List[int] = field(default_factory=list)
-    fragments: List[FragmentHeader] = field(default_factory=list)
-    _hdr0_byte: int = 0
-    _hdr1_byte: int = 0
-
-    def launch(self) -> None:
-        self.ctrl_state = HDR0
-        self.rans_state_p0 = 0
-        self.rans_state_p1 = 0
+    def __init__(self, idx, ab, target):
+        self.idx, self.ab, self.target = idx, ab, target
+        self.state = IDLE
+        self.ib = 0
+        self.ib_full = False
+        self.sym = 0
+        self.sym_full = False
+        self.in_rem = self.out_rem = 0
+        self.p0 = self.p1 = 0
+        self.hdr3 = self.flush = False
+        self.q = self.eab = 0
+        self.model = None
         self.done = False
+        self.go = True
+        self.stall = False
+        self.syms = []
+        self.nbytes = 0
+        self.final = None
+        self.frags = []        # (header byte, payload budget)
 
-    def need_ib_load(self) -> bool:
-        if self.input_buf_full:
+    def need_byte(self):
+        if self.ib_full:
             return False
-        if self.ctrl_state in (HDR0, HDR1, HDR2):
+        if self.state in (HDR0, HDR1, HDR2):
             return True
-        if self.ctrl_state == PROC:
-            return self.input_remaining > (1 if self.input_buf_full else 0)
-        return False
+        return self.state == PROC and self.in_rem > 0
 
-    def step_phase0(self, stream: bytes, pos: int, sym_ready: bool) -> int:
-        blocked = self.sym_buf_full and not sym_ready
-        if not blocked:
-            if self.ctrl_state in (PROC, DRAIN) or self.sym_buf_full:
-                if self.sym_buf_full:
-                    fwd_f, fwd_cf = self.model.forward_params(self.sym_buf)
-                    fwd_p = self.rans_state_p1 & 0xFFFF
-                    self.rans_state_p0 = (fwd_f * (self.rans_state_p1 >> 16) + fwd_p - fwd_cf) & 0xFFFFFFFF
-                    if self.done:
-                        self.rans_state_p1 = self.rans_state_p0
-                else:
-                    self.rans_state_p0 = self.rans_state_p1
-            if self.sym_buf_full and sym_ready:
-                self.decoded_symbols.append(self.sym_buf)
-                self.sym_buf_full = False
-        if self.need_ib_load() and pos < len(stream):
-            self.input_buf = stream[pos]
-            self.input_buf_full = True
-            pos += 1
-        return pos
-
-    def step_phase1(self, stalled: bool) -> None:
-        if stalled or self.ctrl_state == IDLE:
-            return
-        if self.ctrl_state == HDR0:
-            if self.input_buf_full:
-                b = self.input_buf
-                self._hdr0_byte = b
-                self.input_remaining = 0
-                self.ctrl_state = HDR1
-                z, hdr3, flush, q = FragmentHeader.parse_mode_byte(b)
-                self.current_q = q
-                self.hdr3 = hdr3
-                self.flush_per_frag = flush
-                self.eab = max(1, min(8, self.alphabet_bits - z))
-                self.input_buf_full = False
-        elif self.ctrl_state == HDR1:
-            if self.input_buf_full:
-                b = self.input_buf
-                self._hdr1_byte = b
-                self.input_buf_full = False
-                self.model = get_model(self.eab, self.current_q)
-                if self.hdr3:
-                    self.input_remaining = b
-                    self.ctrl_state = HDR2
-                else:
-                    self.input_remaining = b + 1
-                    self.fragments.append(FragmentHeader.from_bytes(self._hdr0_byte, b, None))
-                    self.ctrl_state = PROC
-        elif self.ctrl_state == HDR2:
-            if self.input_buf_full:
-                b = self.input_buf
-                self.input_buf_full = False
-                self.input_remaining = ((b << 8) | (self.input_remaining & 0xFF)) + 257
-                self.fragments.append(FragmentHeader.from_bytes(self._hdr0_byte, self._hdr1_byte, b))
-                self.ctrl_state = PROC
-        elif self.ctrl_state in (PROC, DRAIN):
-            is_proc = self.ctrl_state == PROC
-            want_to_feed = is_proc and (self.rans_state_p0 < RANS_L) and (self.input_remaining > 0)
-            will_feed = want_to_feed and self.input_buf_full
-            if will_feed:
-                st_in = ((self.rans_state_p0 & 0xFFFFFF) << 8) | self.input_buf
-                new_in_rem = self.input_remaining - 1
-            else:
-                st_in = self.rans_state_p0
-                new_in_rem = self.input_remaining
-
-            cf_in = st_in & 0xFFFF
-            new_sym = self.model.inverse_lookup(cf_in)[0] if cf_in > 0 else 0
-            next_sym_full = (st_in > RANS_L) and (self.output_remaining > 0)
-            new_out_rem = self.output_remaining - 1 if next_sym_full else self.output_remaining
-
-            self.rans_state_p1 = st_in
-            self.output_remaining = new_out_rem
-            self.sym_buf = new_sym
-            self.sym_buf_full = next_sym_full
-
-            if is_proc:
-                self.input_remaining = new_in_rem
-                if will_feed:
-                    self.input_buf_full = False
-                if new_in_rem == 0:
-                    if new_out_rem > 0:
-                        if st_in == RANS_L:
-                            self.ctrl_state = HDR0
-                            if self.flush_per_frag:
-                                self.rans_state_p1 = 0
-                        else:
-                            self.ctrl_state = DRAIN
-                    else:
-                        self.done = True
-                        self.ctrl_state = IDLE
-            elif st_in <= RANS_L:
-                if new_out_rem > 0:
-                    self.ctrl_state = HDR0
-                    if self.flush_per_frag:
-                        self.rans_state_p0 = 0
-                        self.rans_state_p1 = 0
-                else:
-                    self.ctrl_state = IDLE
-                    self.done = True
+    def forward_state(self, x, sym):
+        f, cf = self.model.forward(sym)
+        return (f * (x >> 16) + (x & 0xFFFF) - cf) & 0xFFFFFFFF
 
 
-def parse_main_8lane_header(stream: bytes) -> List[FragmentHeader]:
-    if len(stream) < 48:
-        raise ValueError("stream shorter than 48-byte main header")
-    return [FragmentHeader.from_bytes(stream[i], stream[8 + i], stream[16 + i]) for i in range(8)]
+def decode_lanes(data, alphabet_bits, targets, window=FEED_WINDOW, source=None):
+    """Run the lanes over one shared byte stream.
 
-
-def decode_multilane_stream(
-    stream: bytes, alphabet_bits: Sequence[int], symbols_per_lane: int
-) -> List[RansLane]:
-    lanes = [RansLane(i, ab, symbols_per_lane) for i, ab in enumerate(alphabet_bits)]
-    for l in lanes[:8]:
-        l.launch()
+    data: the chunk bytes (trailing zero padding allowed). source: optional
+    callable(lane_index) -> next byte, used by the synthetic encoder to learn
+    the interleave order (then `data` is ignored and the order is recorded).
+    Returns dict(syms, consumed, cycles, lanes, order). Raises BCPackError
+    unless every lane finished with a legal end state.
+    """
+    n = len(alphabet_bits)
+    lanes = [Lane(i, alphabet_bits[i], targets[i]) for i in range(n)]
+    slots = [False] * n
     pos = 0
-    max_rounds = symbols_per_lane * 6 + 128
-    for rnd in range(max_rounds):
-        if rnd == 6:
-            for l in lanes[8:]:
-                l.launch()
-        all_ready = all(l.ctrl_state == IDLE or l.done or l.sym_buf_full for l in lanes)
-        stalled = [l.sym_buf_full and not all_ready for l in lanes]
-        for l in lanes:
-            pos = l.step_phase0(stream, pos, all_ready)
-        for l, st in zip(lanes, stalled):
-            l.step_phase1(st)
-        if all(l.done and not l.sym_buf_full for l in lanes):
-            return lanes
-    raise ValueError("multi-lane stream did not finish within max_rounds")
-
-
-def encode_multilane_stream(lanes_spec: Sequence[Tuple[int, int, int, Sequence[int]]]) -> bytes:
-    records: List[bytes] = []
-    for ab, z, q, syms in lanes_spec:
-        eab = max(1, min(8, ab - z))
-        m = get_model(eab, q)
-        payload = m.encode_fragment(syms)
-        hdr = FragmentHeader.encode_header(z, True, q, len(payload))
-        records.append(hdr + payload)
-
-    n_lanes = len(lanes_spec)
-    out_target = len(lanes_spec[0][3])
-    lanes = [RansLane(i, ab, len(syms)) for i, (ab, _, _, syms) in enumerate(lanes_spec)]
-    lane_pos = [0] * n_lanes
-    out = bytearray()
-
-    for l in lanes[:8]:
-        l.launch()
-
-    for rnd in range(out_target * 6 + 128):
-        if rnd == 6:
-            for l in lanes[8:]:
-                l.launch()
-        all_ready = all(l.ctrl_state == IDLE or l.done or l.sym_buf_full for l in lanes)
-        stalled = [l.sym_buf_full and not all_ready for l in lanes]
-        for i, l in enumerate(lanes):
-            blocked = l.sym_buf_full and not all_ready
-            if not blocked:
-                if l.ctrl_state in (PROC, DRAIN) or l.sym_buf_full:
-                    if l.sym_buf_full:
-                        fwd_f, fwd_cf = l.model.forward_params(l.sym_buf)
-                        fwd_p = l.rans_state_p1 & 0xFFFF
-                        l.rans_state_p0 = (fwd_f * (l.rans_state_p1 >> 16) + fwd_p - fwd_cf) & 0xFFFFFFFF
-                        if l.done:
-                            l.rans_state_p1 = l.rans_state_p0
+    end = len(data) if source is None else 1 << 62
+    order = []
+    cycle = 0
+    max_cycles = 64 * (sum(targets) + (len(data) if source is None else 0)) + 1000
+    last_prog, last_change = None, 0
+    while cycle < max_cycles:
+        # phase 0: forward update, byte feed (lane order, <= window per clock), symbol hand-off
+        served = 0
+        for ln in lanes:
+            sym_ready = not slots[ln.idx]
+            blocked_out = ln.sym_full and not sym_ready
+            need = ln.need_byte()
+            req = need and not blocked_out
+            valid = req and served < window and pos < end
+            ln.stall = (need and not valid) or blocked_out
+            if ln.stall:
+                continue
+            if ln.state in (PROC, DRAIN):
+                ln.p0 = ln.forward_state(ln.p1, ln.sym) if ln.sym_full else ln.p1
+            if valid:
+                if source is None:
+                    ln.ib = data[pos]
+                else:
+                    ln.ib = source(ln.idx)
+                    order.append(ln.idx)
+                pos += 1
+                served += 1
+                ln.nbytes += 1
+                ln.ib_full = True
+            if ln.sym_full:
+                slots[ln.idx] = True
+                ln.syms.append(ln.sym)
+                ln.sym_full = False
+        # phase 1: header FSM, renormalisation, symbol decode
+        for ln in lanes:
+            if ln.stall:
+                continue
+            st = ln.state
+            if st == IDLE:
+                if ln.go:
+                    ln.go = False
+                    ln.state = HDR0
+                    ln.out_rem = ln.target
+                    ln.p0 = ln.p1 = 0
+            elif st == HDR0:
+                if ln.ib_full:
+                    b = ln.ib
+                    ln.ib_full = False
+                    ln.in_rem = 0
+                    ln.state = HDR1
+                    ln.q = b & 15
+                    ln.hdr3 = bool(b & 0x20)
+                    ln.flush = bool(b & 0x10)
+                    e = ln.ab - (b >> 6)
+                    if e < 0:
+                        e &= 15
+                    ln.eab = e if e < 10 else 9
+                    ln.frags.append([b, None])
+                    if ln.eab > 8:
+                        raise BCPackError("lane %d: header selects alphabet index %d" % (ln.idx, ln.eab))
+            elif st == HDR1:
+                if ln.ib_full:
+                    ln.ib_full = False
+                    ln.model = model(ln.eab, ln.q)
+                    if ln.hdr3:
+                        ln.in_rem = ln.ib
+                        ln.state = HDR2
                     else:
-                        l.rans_state_p0 = l.rans_state_p1
-                if l.sym_buf_full and all_ready:
-                    l.decoded_symbols.append(l.sym_buf)
-                    l.sym_buf_full = False
-            if l.need_ib_load() and lane_pos[i] < len(records[i]):
-                b = records[i][lane_pos[i]]
-                lane_pos[i] += 1
-                out.append(b)
-                l.input_buf = b
-                l.input_buf_full = True
-        for l, st in zip(lanes, stalled):
-            l.step_phase1(st)
-        if all(l.done and not l.sym_buf_full for l in lanes):
-            break
-    return bytes(out)
+                        ln.in_rem = ln.ib + 1
+                        ln.state = PROC
+                        ln.frags[-1][1] = ln.in_rem
+            elif st == HDR2:
+                if ln.ib_full:
+                    ln.ib_full = False
+                    ln.in_rem = ((ln.ib << 8) | (ln.in_rem & 0xFF)) + 257
+                    ln.frags[-1][1] = ln.in_rem
+                    ln.state = PROC
+            else:  # PROC or DRAIN
+                will = st == PROC and ln.p0 < L and ln.in_rem > 0 and ln.ib_full
+                x = (((ln.p0 & 0xFFFFFF) << 8) | ln.ib) if will else ln.p0
+                nsf = x > L and ln.out_rem > 0
+                new_out = ln.out_rem - 1 if nsf else ln.out_rem
+                ln.p1 = x
+                ln.out_rem = new_out
+                if nsf:
+                    ln.sym = ln.model.inverse(x & 0xFFFF)
+                ln.sym_full = nsf
+                if st == PROC:
+                    if will:
+                        ln.in_rem -= 1
+                        ln.ib_full = False
+                    if ln.in_rem == 0:
+                        if new_out > 0:
+                            if x == L:
+                                ln.state = HDR0
+                                if ln.flush:
+                                    ln.p1 = 0
+                            else:
+                                ln.state = DRAIN
+                        else:
+                            ln.done = True
+                            ln.state = IDLE
+                            ln.final = ln.forward_state(x, ln.sym) if nsf else x
+                elif x <= L:
+                    if new_out > 0:
+                        ln.state = HDR0
+                        if ln.flush:
+                            ln.p0 = ln.p1 = 0
+                    else:
+                        ln.done = True
+                        ln.state = IDLE
+                        ln.final = ln.forward_state(x, ln.sym) if nsf else x
+        # lockstep symbol vector: released when every still-active lane has a symbol
+        active = [i for i in range(n) if not (lanes[i].done and not lanes[i].sym_full and not slots[i])]
+        if any(slots) and all(slots[i] for i in active):
+            slots = [False] * n
+        cycle += 1
+        if all(ln.done and not ln.sym_full for ln in lanes):
+            bad = [ln.idx for ln in lanes if ln.final not in LEGAL]
+            if bad:
+                raise BCPackError("lanes %s ended in an illegal state" % bad)
+            return dict(syms=[ln.syms for ln in lanes], consumed=pos, cycles=cycle, order=order,
+                        lanes=[dict(nbytes=ln.nbytes, final=ln.final, frags=ln.frags) for ln in lanes])
+        prog = (pos, sum(len(ln.syms) for ln in lanes), sum(ln.state for ln in lanes))
+        if prog != last_prog:
+            last_prog, last_change = prog, cycle
+        elif cycle - last_change > 64:
+            raise BCPackError("no progress (stream truncated or not BCPack BC1) at byte %d" % pos)
+    raise BCPackError("cycle limit reached")
 
 
-def assemble_bc1_blocks(lanes: Sequence[RansLane], num_blocks: int) -> bytes:
-    out = bytearray(num_blocks * 8)
-    r0 = g0 = b0 = r1 = g1 = b1 = 0
-    for i in range(num_blocks):
-        r0 = (r0 + lanes[2].decoded_symbols[i]) & 0x1F
-        g0 = (g0 + lanes[3].decoded_symbols[i]) & 0x3F
-        b0 = (b0 + lanes[4].decoded_symbols[i]) & 0x1F
-        r1 = (r1 + lanes[5].decoded_symbols[i]) & 0x1F
-        g1 = (g1 + lanes[6].decoded_symbols[i]) & 0x3F
-        b1 = (b1 + lanes[7].decoded_symbols[i]) & 0x1F
-        c0 = (r0 << 11) | (g0 << 5) | b0
-        c1 = (r1 << 11) | (g1 << 5) | b1
-        mode_bit = lanes[0].decoded_symbols[i] & 1
-        if (mode_bit == 0 and c0 < c1) or (mode_bit == 1 and c0 > c1):
-            c0, c1 = c1, c0
-        struct.pack_into(
-            "<HHBBBB",
-            out,
-            i * 8,
-            c0,
-            c1,
-            lanes[8].decoded_symbols[i] & 0xFF,
-            lanes[9].decoded_symbols[i] & 0xFF,
-            lanes[10].decoded_symbols[i] & 0xFF,
-            lanes[11].decoded_symbols[i] & 0xFF,
-        )
-    return bytes(out)
+def decode_symbols(chunk, blocks):
+    """BC1 chunk -> 12 lane symbol lists (each `blocks` long). Checks that every
+    byte after the last consumed one is zero padding."""
+    r = decode_lanes(chunk, BC1_ALPHABET_BITS, [blocks] * 12)
+    if any(chunk[r["consumed"]:]):
+        raise BCPackError("non-zero bytes after the end of the stream (%d of %d consumed)"
+                          % (r["consumed"], len(chunk)))
+    return r["syms"], r
 
 
-class TestBCPack(unittest.TestCase):
-    def test_all_models_sum_to_65536(self) -> None:
-        for eab in range(1, 9):
-            for q in range(16):
-                m = get_model(eab, q)
-                counts = [1] + [1 << (k - 1) for k in range(1, eab + 1)]
-                self.assertEqual(sum(f * c for f, c in zip(m.freqs, counts)), RANS_M)
-
-    def test_patent_table_exact(self) -> None:
-        m = get_model(8, 11)
-        self.assertEqual(m.freqs, (7575, 6701, 5582, 3892, 1918, 494, 34, 1, 1))
-        self.assertEqual(m.bases, (0, 7575, 14276, 25440, 41008, 56352, 64256, 65344, 65408))
-
-    def test_canonical_constant_states(self) -> None:
-        for eab, q, n, exp_st in (
-            (2, 12, 1024, 0x01107ED4),
-            (2, 12, 1536, 0x01192334),
-            (2, 12, 4096, 0x0148A474),
-            (3, 13, 1536, 0x0134B898),
-            (5, 14, 1536, 0x021D88C0),
-            (5, 14, 4096, 0x07618900),
-            (1, 11, 8192, 0x0148B64C),
-        ):
-            m = get_model(eab, q)
-            p = m.encode_fragment([0] * n)
-            self.assertEqual(struct.unpack(">I", p)[0], exp_st)
-            dec, end_x = m.decode_fragment(p, n)
-            self.assertEqual(len(dec), n)
-            self.assertEqual(end_x, RANS_L)
-
-    def test_multilane_bc1_roundtrip(self) -> None:
-        n = 32
-        specs = [
-            (8, 0, 8, [i % 4 for i in range(n)]),
-            (8, 3, 14, [0] * n),
-            (5, 3, 12, [0] * n),
-            (6, 1, 10, [i % 5 for i in range(n)]),
-            (5, 3, 12, [0] * n),
-            (5, 2, 11, [i % 3 for i in range(n)]),
-            (6, 3, 13, [0] * n),
-            (5, 3, 12, [0] * n),
-            (8, 0, 2, [(i * 13) & 0xFF for i in range(n)]),
-            (8, 0, 2, [(i * 29) & 0xFF for i in range(n)]),
-            (8, 0, 2, [(i * 53) & 0xFF for i in range(n)]),
-            (8, 0, 2, [(i * 97) & 0xFF for i in range(n)]),
-        ]
-        stream = encode_multilane_stream(specs)
-        lanes = decode_multilane_stream(stream, BC1_LANE_AB, n)
-        for i, l in enumerate(lanes):
-            self.assertEqual(l.decoded_symbols, specs[i][3])
-            self.assertTrue(is_legal_end_state(l.rans_state_p1))
-        bc1 = assemble_bc1_blocks(lanes, n)
-        self.assertEqual(len(bc1), n * 8)
+# ---------------------------------------------------------------------------
+# BC1 semantics
+# ---------------------------------------------------------------------------
+def load_window(path=os.path.join(DATA, "bc1_window.json")):
+    """256 preset endpoint tuples (unfitted slots read as zeros) + fitted mask."""
+    d = json.load(open(path))
+    win = [(0, 0, 0, 0, 0, 0)] * 256
+    fitted = [False] * 256
+    for s, e in enumerate(d["slots"]):
+        if e is not None:
+            win[s] = tuple(e["value"])
+            fitted[s] = True
+    return win, fitted
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Clean-room Xbox Series BCPack rANS decoder")
-    ap.add_argument("--selftest", action="store_true", help="Run synthetic unit tests")
-    a = ap.parse_args()
-    if a.selftest:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestBCPack)
-        res = unittest.TextTestRunner(verbosity=2).run(suite)
-        return 0 if res.wasSuccessful() else 1
-    ap.print_help()
+def load_quad_table(path=os.path.join(DATA, "bc1_quad_table.json")):
+    """symbol -> codes (TL, TR, BL, BR) of a 2x2 pixel group."""
+    d = json.load(open(path))
+    return [tuple(e["codes"]) for e in sorted(d["entries"], key=lambda e: e["sym"])]
+
+
+def back_distance(v):
+    """Lane 0 symbol -> distance: unzigzag(v) mod 256 (0 = no reference)."""
+    return (v >> 1) if not (v & 1) else 255 - (v >> 1)
+
+
+def unzigzag(v):
+    return -((v + 1) >> 1) if v & 1 else v >> 1
+
+
+def endpoints(syms, window, fitted=None):
+    """Lanes 0, 2-7 -> list of (R0, G0, B0, R1, G1, B1) per block, plus the number of
+    blocks whose reference chain reaches an unfitted window slot."""
+    n = len(syms[0])
+    l0 = syms[0]
+    res = [syms[2 + k] for k in range(6)]
+    mods = [1 << w for w in BC1_ENDPOINT_WIDTHS]
+    E = [None] * n
+    tainted = [False] * n
+    zero = (0, 0, 0, 0, 0, 0)
+    for i in range(n):
+        d = back_distance(l0[i])
+        t = False
+        if d == 0:
+            P = zero
+        elif d <= i:
+            P = E[i - d]
+            t = tainted[i - d]
+        else:
+            slot = (i - d) & 255
+            P = window[slot]
+            t = fitted is not None and not fitted[slot]
+        E[i] = tuple((P[k] + unzigzag(res[k][i])) % mods[k] for k in range(6))
+        tainted[i] = t
+    return E, sum(tainted)
+
+
+QUAD_ORIGIN = ((0, 0), (2, 0), (0, 2), (2, 2))   # (x, y) of TL, TR, BL, BR groups
+GROUP_PIXEL = ((0, 0), (1, 0), (0, 1), (1, 1))   # codes order inside a group
+
+
+def quad_masks(table):
+    """symbol -> 32-bit index-word contribution for each of the 4 quadrants."""
+    out = []
+    for q, (ox, oy) in enumerate(QUAD_ORIGIN):
+        row = []
+        for codes in table:
+            w = 0
+            for k, (dx, dy) in enumerate(GROUP_PIXEL):
+                x, y = ox + dx, oy + dy
+                w |= codes[k] << (2 * (4 * y + x))
+            row.append(w)
+        out.append(row)
+    return out
+
+
+def assemble_bc1(syms, window, table, fitted=None):
+    E, tainted = endpoints(syms, window, fitted)
+    masks = quad_masks(table)
+    out = bytearray()
+    for i, e in enumerate(E):
+        c0 = (e[0] << 11) | (e[1] << 5) | e[2]
+        c1 = (e[3] << 11) | (e[4] << 5) | e[5]
+        idx = masks[0][syms[8][i]] | masks[1][syms[9][i]] | masks[2][syms[10][i]] | masks[3][syms[11][i]]
+        out += struct.pack("<HHI", c0, c1, idx)
+    return bytes(out), tainted
+
+
+def decode_bc1(chunk, blocks, window=None, table=None):
+    """BCPack BC1 chunk bytes -> BC1 blocks (8 bytes each, stream / Gfx10 order)."""
+    if window is None:
+        window, fitted = load_window()
+    else:
+        fitted = None
+    table = table or load_quad_table()
+    syms, _ = decode_symbols(chunk, blocks)
+    data, _ = assemble_bc1(syms, window, table, fitted)
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Self-test: synthetic vectors written by the Rust encoder (tests/vectors)
+# ---------------------------------------------------------------------------
+def selftest():
+    import hashlib
+    t = [BASE_TABLE, FREQ_TABLE, RF_TABLE, RS_TABLE, RN_TABLE]
+    text = "".join(",".join(str(v) for e in tab for q in e for v in q) + "\n" for tab in t)
+    assert hashlib.sha256(text.encode()).hexdigest() == TABLES_SHA256, "table checksum"
+    # reciprocal inverse == exact division for every model and cf
+    for eab in range(9):
+        for q in range(16):
+            m = model(eab, q)
+            for cf in range(1, 65536, 7):
+                s = m.inverse(cf)
+                f, c = m.forward(s)
+                assert c <= cf < c + f, (eab, q, cf, s)
+    vdir = os.path.join(os.path.dirname(HERE), "tests", "vectors")
+    n = 0
+    for fn in sorted(os.listdir(vdir)) if os.path.isdir(vdir) else []:
+        if not fn.endswith(".json"):
+            continue
+        v = json.load(open(os.path.join(vdir, fn)))
+        chunk = bytes.fromhex(v["chunk_hex"])
+        syms, _ = decode_symbols(chunk, v["blocks"])
+        assert syms == v["symbols"], fn
+        if "bc1_sha256" in v:
+            # same test tables as tests/roundtrip.rs::test_tables
+            win = [tuple((s * 7 + k * 13) % (1 << BC1_ENDPOINT_WIDTHS[k]) for k in range(6)) for s in range(256)]
+            tab = [tuple((s >> (2 * k)) & 3 for k in range(4)) for s in range(256)]
+            out = decode_bc1(chunk, v["blocks"], window=win, table=tab)
+            assert hashlib.sha256(out).hexdigest() == v["bc1_sha256"], fn
+        n += 1
+    print("selftest ok: tables, inverse, %d synthetic vectors" % n)
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "selftest":
+        selftest()
+    elif len(argv) == 5 and argv[1] == "decode-bc1":
+        data = open(argv[2], "rb").read()
+        out = decode_bc1(data, int(argv[3]))
+        open(argv[4], "wb").write(out)
+        print("wrote %d blocks" % (len(out) // 8))
+    elif len(argv) == 4 and argv[1] == "symbols":
+        syms, r = decode_symbols(open(argv[2], "rb").read(), int(argv[3]))
+        print("consumed %d bytes, %d cycles" % (r["consumed"], r["cycles"]))
+        for i, s in enumerate(syms):
+            print(i, " ".join(map(str, s)))
+    else:
+        print(__doc__)
+        return 2
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))

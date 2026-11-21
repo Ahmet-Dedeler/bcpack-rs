@@ -1,10 +1,11 @@
 [package]
 name = "bcpack-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Work-in-progress reverse engineering of the Xbox Series MDU BCPack rANS texture codec"
+description = "Decoder for Xbox Series BCPack (MDU rANS) BC1 texture streams"
 repository = "https://github.com/Ahmet-Dedeler/bcpack-rs"
+include = ["src/**", "data/**", "python/**", "docs/**", "tests/**", "tools/**", "README.md", "THIRD_PARTY_NOTICES.md", "LICENSE-*"]
 
 [lib]
 name = "bcpack"
@@ -15,3 +16,16 @@ name = "bcpack"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1.1"
+png = "0.17"
+rayon = "1.10"
+serde_json = "1.0"
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
