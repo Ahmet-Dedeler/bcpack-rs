@@ -84,13 +84,9 @@ def fit(S, tgt, start=None, passes=3):
     return W, best
 
 
-BY = {}
-
-
 def fit_slot(args):
-    """Joint multi-start fit of one slot (runs in a worker; BY is inherited via fork)."""
-    sl, max_joint = args
-    items = BY[sl]
+    """Joint multi-start fit of one slot (runs in a worker; data passed in args: macOS spawns)."""
+    sl, max_joint, items = args
     rng = np.random.default_rng(sl)
     Sall = np.concatenate([x[1] for x in items]); Tall = np.concatenate([x[2] for x in items])
     if len(Sall) > max_joint:                      # subsample for the search, score on all
@@ -139,10 +135,8 @@ def main():
             if m.sum() >= a.min_blocks:
                 by_slot[sl].append((tid, S[m], tgt[m]))
     slots = [int(x) for x in a.slots.split(",")] if a.slots else sorted(by_slot, key=lambda s: -len(by_slot[s]))[:a.top]
-    global BY
-    BY = by_slot
     with Pool(min(16, len(slots))) as pool:
-        results = pool.map(fit_slot, [(sl, a.max_joint) for sl in slots if by_slot[sl]])
+        results = pool.map(fit_slot, [(sl, a.max_joint, by_slot[sl]) for sl in slots if by_slot[sl]])
     out = {}
     for sl, txt, rec in results:
         print(txt, flush=True)

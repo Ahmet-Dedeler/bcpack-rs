@@ -90,17 +90,40 @@ the chunk (all bytes are accounted for by the 12 lanes). What was tested:
 Usage is very uneven, so a few slots cover most chunks. In 599 chunks: slot 254 (415 refs), 193 (390), 128 (293),
 242 (285), 89 (112), 99, 232, 121, 255, ... The first block's lane 0 is 0 (no reference) in 165/599.
 
-Fitted slot values (R0 G0 B0 R1 G1 B1, from `/tmp/bcpack-shared/window_fit.json`, joint over all
-textures that root a chain there). Confidence comes from the joint cost; the coordinate search can get stuck
-in local minima, which is why the multi-start version matters:
+Fitted slot values (`python -I tools/sem/window_fit.py --n 600 --side 512 --top 16`, parallel multi-start,
+joint over every texture that roots a chain at the slot; written to `/tmp/bcpack-shared/window_fit.json`).
+"within 2" = textures where the single joint value scores within 2 units of that texture's own best value:
 
-| slot | value | mean capped dist (joint) | textures | status |
-|---|---|---|---|---|
-| 242 | 16 29 31 / 16 34 31 | 2.4 | 64 | solid (multi-start) |
-| 121 | 31 61 30 / 31 62 29 | 2.6 | 32 | solid (single start) |
-| 255 | 0 0 1 / 0 0 0 | 1.6 | 24 | solid (single start) |
-| 82  | 26 11 31 / 8 9 31 | 4.4 | 12 | likely |
-| 254, 193, 128, 232, 99, 89, 118, 91 | see json | 9-33 single start | 12-63 | not converged yet (see `wf2.txt` multi-start run) |
+| slot | R0 G0 B0 / R1 G1 B1 | textures | blocks | joint mean capped dist | within 2 |
+|---|---|---|---|---|---|
+| 242 | 16 29 31 / 16 34 31 | 100 | 246,579 | 2.5 | 100/100 |
+| 254 | 17 25 31 / 15 36 31 | 97 | 239,507 | 2.6 | 97/97 |
+| 193 | 16 35 31 / 15 25 31 | 92 | 237,993 | 2.3 | 92/92 |
+| 128 | 19 32 31 / 12 32 31 | 84 | 214,963 | 2.3 | 83/84 |
+| 121 | 31 62 30 / 31 61 29 | 48 | 220,676 | 2.5 | 48/48 |
+| 232 | 16 31 16 / 15 31 15 | 39 | 92,271 | 3.9 | 34/39 |
+| 255 | 0 0 1 / 0 0 0 | 33 | 98,242 | 1.6 | 33/33 |
+| 99 | 17 45 30 / 15 33 31 | 28 | 25,756 | 3.4 | 27/28 |
+| 89 | 19 18 31 / 9 43 31 | 26 | 21,170 | 9.2 | 21/26 |
+| 139 | 18 36 18 / 16 33 16 | 20 | 44,541 | 3.3 | 20/20 |
+| 92 | 19 32 30 / 15 43 31 | 19 | 18,459 | 3.8 | 19/19 |
+| 118 | 14 42 31 / 12 22 30 | 16 | 5,738 | 5.0 | 16/16 |
+| 82 | 20 10 31 / 13 10 31 | 15 | 19,772 | 2.7 | 14/15 |
+| 17 | 8 44 30 / 6 26 30 | 14 | 60,166 | 2.1 | 14/14 |
+| 53 | 30 50 3 / 29 46 2 | 14 | 67,848 | 2.1 | 14/14 |
+| 91 | 18 15 30 / 15 33 31 | 14 | 1,435 | 6.8 | 14/14 |
+
+Overall 548/563 (texture, slot) cases agree with one value per slot. A zero root fits essentially none of them (cost about 40,
+the cap). So the preset is the same for every chunk. The earlier "per-category" clusters came from local minima of the
+single-start search.
+
+End to end with the fitted slots (`python -I tools/sem/mip_endpoints.py --n 80`, midpoint indices, harness mipscore):
+
+| textures (79 decoded, 1 skipped: simulator does not converge on `ttdb_maps_4_7.ttpf:43730`) | n | rule + fitted window | zero window | psnr_flat | left | shuffled |
+|---|---|---|---|---|---|---|
+| no pre-start references | 15 | **27.2 dB** (beats flat by more than 3 dB in 15/15) | 27.2 | 18.2 | 11.0 | 15.3 |
+| all pre-start references in fitted slots | 14 | **22.7 dB** | 10.4 | 19.9 | 9.2 | 14.2 |
+| touches at least one unfitted slot | 50 | 9.2 | 8.6 | 16.5 | 8.7 | 8.8 |
 
 Entries look like a trained codebook of common endpoint pairs (many have B = 31, typical of normal maps).
 They do not look like a formula of the slot index. An exact search of the store's decompressed plain data for
@@ -115,8 +138,8 @@ the slot-121/254/82 colour pairs found nothing systematic.
   order were tried as predictors and are wrong; the predictor is purely the lane-0 back-reference.
 
 ## 5. Next steps
-1. Fit all 255 window slots: run `window_fit.py` with `--slots` over every used slot, multi-start, on many
-   more textures (all 4,809 pairs). Better: once indices are solved, fit with exact block
+1. Fit the rest of the 256-slot window (16 done, and they cover the most-used slots). Run `window_fit.py --top 256 --min-blocks 8`
+   on all 4,809 pairs (larger `--n`/`--side`). Better: once indices are solved, fit with exact block
    means (a linear constraint) instead of segment distance. Ship the table as a decoder constant.
 2. Re-check the rule on 1536-block multi-stream chunks (lanes 0/2-7 carry 96-257 symbols there) and on
    >65,536-block chunks. The window probably resets per sub-stream (not tested; no pair texture uses them).
