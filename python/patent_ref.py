@@ -709,6 +709,23 @@ def selftest(seed: int = 1, n_cases: int = 300) -> None:
         _check_lane(data, ab, syms)
         ok += 1
     print(f"multi-fragment round trips (functional == cycle model): {ok}/{tried}")
+    # 3b. lanes whose fragments all retain state (flush=0) across boundaries
+    ok = tried = 0
+    for _ in range(120):
+        ab = rng.randrange(1, 9)
+        frags = []
+        for k in range(3):
+            q = rng.randrange(16)
+            frags.append(FragmentSpec(_rand_symbols(rng, model_for(ab, 0, q),
+                                                    rng.choice((5, 50, 700))), q, 0, False))
+        try:
+            data = encode_lane(ab, frags)
+        except ValueError:
+            continue
+        tried += 1
+        _check_lane(data, ab, [s for f in frags for s in f.symbols])
+        ok += 1
+    print(f"all-retained 3-fragment lanes: {ok}/{tried}")
     # 4. corrupted byte budget must fail the convergence check
     m = Model(7, 11)
     syms = _rand_symbols(rng, m, 500)
@@ -737,5 +754,26 @@ def selftest(seed: int = 1, n_cases: int = 300) -> None:
     print("2-lane shared-stream round trip via lane-order feeder: ok")
 
 
+def diff_against_bcpack() -> int:
+    """Compare the exact Verilog freq tables with bcpack.py's fitted lambda(q) models."""
+    import bcpack  # the earlier hypothesis implementation, same directory
+    same = 0
+    rows = []
+    for bits in range(1, 9):
+        for q in range(16):
+            exact = tuple(FREQ_TABLE[bits - 1][q][: bits + 1])
+            fit = tuple(bcpack.get_model(bits, q).freqs)
+            if exact == fit:
+                same += 1
+            else:
+                rows.append((bits, q, exact, fit))
+    print(f"bcpack.py fitted models identical to Verilog: {same}/128 (bits 1..8; 9-bit not modelled)")
+    for bits, q, exact, fit in rows:
+        print(f"  bits={bits} q={q:2d} exact={list(exact)}\n  {'':13s}fit  ={list(fit)}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--diff-bcpack" in sys.argv:
+        raise SystemExit(diff_against_bcpack())
     selftest()
