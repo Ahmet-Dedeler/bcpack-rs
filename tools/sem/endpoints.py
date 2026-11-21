@@ -201,15 +201,21 @@ def decode_window(syms, resid="zigA", zero_mode="zero", before="zero", history=N
     return np.array(E, dtype=np.int64)
 
 
-def load_window(path="/tmp/bcpack-shared/window_fit.json"):
+def load_window(path="/tmp/bcpack-shared/window_table.json", min_textures=1):
     """Initial window (256 slots, R0 G0 B0 R1 G1 B1) from window_fit.py output; unfitted slots = 0.
-    history[slot] is what a pre-start reference to ring slot (i - d) mod 256 reads."""
+    history[slot] is what a pre-start reference to ring slot (i - d) mod 256 reads.
+    Accepts the current format ({slot: {value, textures, ...}}) and the older one ({slot: {joint}})."""
     import json
     W = [(0, 0, 0, 0, 0, 0)] * 256
-    try:
-        with open(path) as f:
-            for k, v in json.load(f).items():
-                W[int(k)] = tuple(v["joint"])
-    except FileNotFoundError:
-        pass
+    for pth in (path, "/tmp/bcpack-shared/window_fit.json"):
+        try:
+            with open(pth) as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            continue
+        d = d.get("slots", d)
+        for k, v in d.items():
+            if v.get("textures", 99) >= min_textures:
+                W[int(k)] = tuple(v.get("value") or v["joint"])
+        break
     return W
