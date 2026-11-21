@@ -3,7 +3,7 @@ name = "bcpack-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Clean-room Xbox Series MDU BCPack texture decompressor and rANS entropy codec (BC1-BC7)"
+description = "Work-in-progress reverse engineering of the Xbox Series MDU BCPack rANS texture codec"
 repository = "https://github.com/Ahmet-Dedeler/bcpack-rs"
 
 [lib]
