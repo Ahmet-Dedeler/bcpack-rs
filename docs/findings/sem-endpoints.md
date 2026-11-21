@@ -116,7 +116,7 @@ the slot-121/254/82 colour pairs found nothing systematic.
 
 ## 5. Next steps
 1. Fit all 255 window slots: run `window_fit.py` with `--slots` over every used slot, multi-start, on many
-   more textures (all 4,809 pairs, plus control textures are not needed). Better: once indices are solved, fit with exact block
+   more textures (all 4,809 pairs). Better: once indices are solved, fit with exact block
    means (a linear constraint) instead of segment distance. Ship the table as a decoder constant.
 2. Re-check the rule on 1536-block multi-stream chunks (lanes 0/2-7 carry 96-257 symbols there) and on
    >65,536-block chunks. The window probably resets per sub-stream (not tested; no pair texture uses them).

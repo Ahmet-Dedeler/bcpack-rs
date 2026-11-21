@@ -84,12 +84,48 @@ def fit(S, tgt, start=None, passes=3):
     return W, best
 
 
+BY = {}
+
+
+def fit_slot(args):
+    """Joint multi-start fit of one slot (runs in a worker; BY is inherited via fork)."""
+    sl, max_joint = args
+    items = BY[sl]
+    rng = np.random.default_rng(sl)
+    Sall = np.concatenate([x[1] for x in items]); Tall = np.concatenate([x[2] for x in items])
+    if len(Sall) > max_joint:                      # subsample for the search, score on all
+        k = rng.choice(len(Sall), max_joint, replace=False)
+        Ss, Ts = Sall[k], Tall[k]
+    else:
+        Ss, Ts = Sall, Tall
+    Wj, _ = fit(Ss, Ts)
+    seeds = {tuple(fit(S, tgt, start=Wj)[0]) for _, S, tgt in items}
+    best = cost(Wj, Ss, Ts).mean()
+    for sd in seeds:
+        W2, c2 = fit(Ss, Ts, start=list(sd), passes=2)
+        if c2 < best:
+            Wj, best = W2, c2
+    cj = float(cost(Wj, Sall, Tall).mean())
+    lines = ["slot %3d: %d textures, %d blocks; joint W=%s mean capped dist %.1f" % (sl, len(items), len(Sall), Wj, cj)]
+    per = []
+    for tid, S, tgt in items:
+        Wt, ct = fit(S, tgt, start=Wj)
+        cjt = cost(Wj, S, tgt).mean(); cz = cost([0] * 6, S, tgt).mean()
+        per.append((tid, Wt, round(float(ct), 1), round(float(cjt), 1), round(float(cz), 1)))
+        lines.append("    %-44s own W=%-26s own %.1f  joint %.1f  zero %.1f  (%d blocks)" % (tid[-44:], Wt, ct, cjt, cz, len(S)))
+    near = sum(1 for p in per if p[3] <= p[2] + 2)
+    lines[0] += "; joint within 2 of own: %d/%d" % (near, len(per))
+    return sl, "\n".join(lines), dict(joint=Wj, joint_cost=cj, near=near, per=per)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--side", type=int, default=512)
     ap.add_argument("--slots", default="")
     ap.add_argument("--min-blocks", type=int, default=24)
+    ap.add_argument("--top", type=int, default=16)
+    ap.add_argument("--max-joint", type=int, default=20000)
     a = ap.parse_args()
     ps = [p for p in common.pairs() if max(p["w"], p["h"]) <= a.side]
     rng = np.random.default_rng(5)
@@ -102,31 +138,15 @@ def main():
             m = (root == sl) & ok
             if m.sum() >= a.min_blocks:
                 by_slot[sl].append((tid, S[m], tgt[m]))
-    slots = [int(x) for x in a.slots.split(",")] if a.slots else sorted(by_slot, key=lambda s: -len(by_slot[s]))[:12]
+    slots = [int(x) for x in a.slots.split(",")] if a.slots else sorted(by_slot, key=lambda s: -len(by_slot[s]))[:a.top]
+    global BY
+    BY = by_slot
+    with Pool(min(16, len(slots))) as pool:
+        results = pool.map(fit_slot, [(sl, a.max_joint) for sl in slots if by_slot[sl]])
     out = {}
-    for sl in slots:
-        items = by_slot[sl]
-        if not items:
-            continue
-        Sall = np.concatenate([x[1] for x in items]); Tall = np.concatenate([x[2] for x in items])
-        Wj, cj = fit(Sall, Tall)
-        # multi-start: seed the joint fit from every per-texture optimum
-        seeds = []
-        for tid, S, tgt in items:
-            seeds.append(fit(S, tgt, start=Wj)[0])
-        for sd in {tuple(x) for x in seeds}:
-            W2, c2 = fit(Sall, Tall, start=list(sd), passes=2)
-            if c2 < cj:
-                Wj, cj = W2, c2
-        print("slot %3d: %d textures, %d blocks; joint W=%s mean capped dist %.1f" % (sl, len(items), len(Sall), Wj, cj))
-        per = []
-        for tid, S, tgt in items:
-            Wt, ct = fit(S, tgt, start=Wj)
-            cz = cost([0] * 6, S, tgt).mean()
-            cjt = cost(Wj, S, tgt).mean()
-            per.append((tid, Wt, round(ct, 1), round(cjt, 1), round(cz, 1)))
-            print("    %-44s own W=%-26s own %.1f  joint %.1f  zero %.1f  (%d blocks)" % (tid[-44:], Wt, ct, cjt, cz, len(S)))
-        out[sl] = dict(joint=Wj, joint_cost=cj, per=per)
+    for sl, txt, rec in results:
+        print(txt, flush=True)
+        out[sl] = rec
     with open(os.path.join(common.SCR, "window_fit.json"), "w") as f:
         json.dump(out, f, indent=1)
 
