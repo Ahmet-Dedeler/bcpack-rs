@@ -1,24 +1,36 @@
 # bcpack-rs
 
-Clean-room Rust crate, CLI, and stdlib-only Python implementation of the Xbox Series X|S Media Decompression Unit (MDU) **BCPack** texture rANS entropy codec (`BC1`–`BC7`).
+Work-in-progress reverse engineering of **BCPack**, the rANS entropy codec that the Xbox Series X|S Media Decompression Unit (MDU) uses for block-compressed (`BC1`–`BC7`) textures. Rust crate + CLI, a stdlib-only Python port, and a written spec.
 
-Licensed under `MIT OR Apache-2.0`. Contains **zero** proprietary game bytes or assets.
+Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all tests use synthetic streams.
 
-## Key Features
+## Status
 
-- **Exact MDU rANS Engine (`M = 2^16`, `L = 2^24`)**: Implements the 2-phase hardware rANS decoder state machine (`DSTATE_IDLE`..`DSTATE_DRAINING`), 16 static probability models (`q = 0..15`) across power-of-two segments (`base_table[eab][q]` / `freq_table[eab][q]`), adjusted symbol widths (`eab = alphabet_bits - z`), slot-0 reservation (`fwd_cf = 1`, `fwd_f = fwd_fa - 1`), and early-trimmed terminal states (`L`, `L >> 8`, `L >> 16`).
-- **Multi-Fragment & Multi-Lane Interleaving**: Supports 2-byte (`hdr3 = 0`, `len = b1 + 1`) and 3-byte (`hdr3 = 1`, `len = u16_le + 257`) fragment headers, 1-symbol uniform prefix fragments (`0x10`, `0x50`, `0x90`, `0xd0`) transitioning in-band to delta fragments, Round-6 index lane launch (`L8..L11`), and lockstep `symvec` output synchronization.
-- **Rust Crate + CLI + Python Module**:
-  - Rust library (`bcpack`) and CLI (`bcpack inspect`, `bcpack decode-bc1`)
-  - Pure-Python stdlib-only module (`python/bcpack.py`, compatible with `python -I`)
-  - Format specification in [`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md)
+**This does not decode textures yet.** What is verified and what is not:
 
-## Quick Start
+| Part | Status |
+|---|---|
+| Fragment header bitfields (`z`, `hdr3`, `flush_per_frag`, `q`) and the 2-byte vs 3-byte length forms | Verified: parsed fragment byte budgets add up exactly to the compressed size of real multi-fragment BC1 chunks |
+| Power-of-two segmented static models, slot-0 reservation, legal end states `{L, L>>8, L>>16}` | Taken from the public patent (`US11234023B2`, Fig. 15) and consistent with every single-symbol fragment observed |
+| Constant-lane and 1-symbol prefix (`0x10`/`0x50`/`0x90`/`0xd0`) fragments | Verified: all 7,162 observed `len == 4` fragments end in a legal state. These are the trivial cases (one symbol or a constant lane) |
+| Exponential decay schedule `λ(q)` for the 16 models | Fitted to the frequency tables observed so far, not confirmed for every `(eab, q)` pair |
+| Multi-symbol lanes, lane interleaving schedule, BC1 block reassembly | **Not working.** `bcpack decode-bc1` runs on real chunks but its output is not valid BC1 (index words are mostly zero in the top bits), so the lane schedule or symbol-to-block mapping is still wrong |
+| BC3–BC7 | Lane layouts in the spec are guesses; nothing is decoded |
+
+If you know the MDU lane schedule or have a known plaintext/compressed BC1 pair, issues and PRs are very welcome.
+
+## Layout
+
+- `src/lib.rs` – rANS lane decoder state machine, static model tables, fragment header parser
+- `src/main.rs` – `bcpack inspect <chunk>` (dump lane and fragment headers) and `bcpack decode-bc1` (experimental, see status)
+- `python/bcpack.py` – the same decoder in pure Python (runs under `python -I`)
+- [`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md) – format notes, with the evidence behind each claim
+
+## Tests
 
 ```bash
-# Run Rust unit tests
 cargo test
-
-# Run stdlib-only Python unit tests
 python3 -I python/bcpack.py --selftest
 ```
+
+Both suites check round trips on synthetic streams built with the same model tables, so they confirm the decoder is self-consistent, not that it matches hardware.
