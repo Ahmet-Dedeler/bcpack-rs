@@ -104,22 +104,87 @@ LSB-first and 0.32 MSB-first. Plain packing scores 0.38 at best.
   and the dominant gradient of a 2x2 group, but not second-order arrangement (e.g. "a a / 1 1" vs
   "0 b / 1 1"), so the exact codebook for the remaining ~200 symbols is NOT determined.
 
-## What is left, and the best leads
+## 5. The full 256-entry table (solved; 248/256 stable across disjoint data)
 
-1. **Exact codebook (256 entries).** Mip 1 cannot separate arrangements with equal mean and equal
-   gradient. Leads:
-   (a) Once `sem-endpoints` decodes endpoints, fit each symbol's pattern by mip-consistency PSNR
-   (greedy per symbol, starting from the most frequent). Endpoints fix the sign/scale per block,
-   so 3-colour blocks can be handled too.
-   (b) Inter-quadrant smoothness at mip-0 resolution: adjacent pixels across quadrant borders
-   should match. Score candidate patterns per symbol by the border agreement with neighbours whose
-   patterns are already known (the uniform symbols 0-3 alone are about 17% of quadrants).
-   (c) Look for the table in Xbox GDK / DirectStorage / MDU firmware or driver binaries. A
-   256-entry table of 2x2 patterns starting with the uniform patterns in code order 2,3,0,1 is a
-   recognisable signature: as bytes, `aa ff 00 55`.
-2. **3-colour blocks** (c0 <= c1, about 15% of plain BC1 blocks). It is not tested whether the same
-   codebook applies there (code 2 = 1/2, code 3 = black).
-3. **Lane 0** correlates with which secondary symbols appear. l0 in {2, 14, 16, 18, 30, 32} favours
-   the vertical splits 23/79, l0 in {4, 8, 12, 52} the horizontal splits 24/110. But MI(lane 0,
-   lane 8) is only 0.038 bits, and the codebook needs no lane-0 context to reach 0.877 of the 0.901
-   ceiling. Hand that to `sem-endpoints`.
+**Table: `tools/sem/quad_table.json`** (derived structure, no game bytes). Symbol -> BC1 codes of
+the 2x2 group in order TL, TR, BL, BR (0 = c0, 1 = c1, 2 = 2/3 c0 + 1/3 c1, 3 = 1/3 c0 + 2/3 c1).
+It is a bijection onto all 4^4 patterns. Lane 8/9/10/11 = TL/TR/BL/BR group of the block, and BC1
+index bit 2*(4y+x) holds pixel (x, y). Every entry carries `stable_halves`, `stable_edgeonly`, a
+swap `margin` and its `share` of occurrences.
+
+### Method (`tools/sem/fullres.py`, `tools/sem/fit_rgb.py`)
+- Endpoints come from the sem-endpoints back-reference rule (lane 0 = distance unzigzag(v) mod 256,
+  lanes 2-7 zigzag residuals mod 2^w). A block counts as known only when its reference chain never
+  reaches before block 0, because that preset window is unsolved. That leaves 5.26 M known blocks
+  out of 20.3 M, 5.07 M of them four-colour, and 621 textures fully known.
+- Per quadrant occurrence and candidate pattern, the cost has three parts:
+  - a mip-1 term, |mean palette colour - mip-1 pixel|^2 / 72;
+  - a robust edge term, log(1 + d^2/100) over the 8 pixel pairs that cross the quadrant border,
+    with neighbours rendered by the current table (pairs into unknown blocks skipped);
+  - the same edge cost for the 4 pairs inside the quadrant.
+- Costs are summed per symbol into a 256 x 256 matrix, then a min-cost bijection is solved
+  (Hungarian, symbols 0-3 fixed) and the loop repeats. Convergence takes 2-5 iterations.
+
+### Anti-overfitting checks (all scores from the harness `mipscore.score(tid, bytes, 'stream')`)
+Scoring script: `tools/sem/psnr.py`. It scores only textures whose endpoints are fully known.
+Controls on the same textures: the same table with symbols 4-255 shuffled, all indices = code 2
+("mid"), and the harness mean-colour guess (`psnr_flat`). Stores are split by index parity in the
+sorted store list (`fit_rgb.store_split`).
+
+| table fitted on | scored on (held out) | n | median | p10 | p90 | > flat + 3 dB |
+|---|---|---|---|---|---|---|
+| even stores, edge + mip-1 terms | odd stores | 319 | **36.63** | 31.51 | 44.68 | 318 / 319 |
+| odd stores, edge + mip-1 terms | even stores | 302 | **36.11** | 31.58 | 44.65 | 302 / 302 |
+| even stores, **edges only, random init** (no mip-1 term at all) | odd stores | 319 | **35.01** | 29.37 | 43.85 | 317 / 319 |
+| controls on the odd stores: shuffled table / mid / flat | | 319 | 28.77 / 26.80 / 19.26 | | | |
+
+Positive control (plain mip 0, harness, 200 textures): median 37.9 dB.
+Commands: `python3 -I tools/sem/psnr.py --table /tmp/bcpack-sem-indices/tab_even.npy --n 400 --stores odd`
+(and `tab_odd.npy --stores even`, `tab_even_edge.npy --stores odd`). The fits:
+`$PY -I tools/sem/fit_rgb.py --stores even --iters 5 --out .../tab_even.npy`, the same with
+`--stores odd`, and `--stores even --no-mip1 --init random --iters 8`.
+
+### Stability (`tools/sem/compare.py`)
+- **Even-store fit vs odd-store fit: 248 / 256 entries identical, 99.76% of all quadrant
+  occurrences.** All 192 most frequent symbols agree. The 8 that differ are rare (frequency rank
+  192+, 0.24% of occurrences). Each is a swap inside a symmetric pair: 229 <-> 235 (`10a1`/`a110`),
+  230 <-> 231 (`1a01`/`011a`), 247 <-> 248 (`0110`/`1001`), 254 <-> 255 (`100b`/`0b10`), codes written
+  TL TR BL BR. Both halves give these large margins with opposite answers, so treat them as
+  unresolved.
+- Edge-only fit from a random start vs the mip-1 fit: 244 / 256 identical (all top 32; 96.3% of
+  occurrences). That run still oscillated on 13 entries.
+- Final table = all stores, initialised from the even fit: 252/256 equal to each half fit, with
+  swap margins of 0.55-3.2 cost units per occurrence on every frequent entry.
+
+### Structure (`tools/sem/structure.py`)
+- No arithmetic rule. The order is a **frequency-sorted trained codebook**: Spearman(symbol, -its
+  frequency in BCPack data) = 0.79, and Spearman(symbol, -frequency of its pattern in plain BC1
+  textures of the same game) = 0.78. Uniform patterns come first, then interpolant-only patterns
+  (codes 2/3), then patterns mixing an endpoint with its neighbouring interpolant, with 0/1 mixes last.
+- Orientation variants of a class sit in runs of 2 or 4 (e.g. 55/56/58/59 = three c1 + one code 3,
+  one per corner; 186/191/194/196 = three c0 + one code 2). The pairs (2k, 2k+1) are NOT consistently
+  related by one symmetry (82/128 pairs match none), so the order inside a class can't be predicted
+  by a rule. This parallels the endpoint pre-start window, also a fixed trained table.
+- The part-1 readouts from mip 1 alone (section 4) all agree with the final table (57 `aa/00`,
+  79 `00/aa`, 22/23, 24/25, 103/110, 186/191/194/196, 55/56/58/59, 4/5, 10/11, 14/21, 26/27, 31/32,
+  34/36, 53/62, 91/101).
+
+### 3-colour blocks (c0 <= c1 as decoded; `tools/sem/three.py --table ... --minsep 40`)
+On known 3-colour blocks with |c0 - c1| >= 40 (96,518 blocks), the quadrant mean colour error vs
+mip 1 is: standard BC1 3-colour semantics (code 2 = midpoint, code 3 = black) **5.58**, code 3 read as
+the midpoint 5.80, code 3 = c1 5.89, palette forced to 4-colour 6.35. The same table on 4-colour
+blocks gives 3.37. So the standard BC1 decode is the best of these, and the decoder need not treat
+these blocks specially. They fit worse than 4-colour blocks, though, and a separate 3-colour table
+was NOT fitted. Open.
+
+### Rendered checks (not committed)
+Three held-out textures (odd stores, table fitted on even stores) are written by `tools/sem/render.py`
+to `/tmp/bcpack-sem-indices/*_mip0_decoded.png`, next to `*_mip1_plain_x2.png`. They score 34.4,
+37.6 and 32.7 dB (flat 8.6, 9.2, 12.3).
+
+## What is left
+1. The 8 symmetric-pair entries (0.24% of occurrences), and fitting the table on all blocks once the
+   endpoint pre-start window is solved: 74% of blocks are still unused.
+2. 3-colour blocks: check whether a per-mode table or code remap closes the 5.6 vs 3.4 gap.
+3. The endpoint pre-start window (sem-endpoints) limits full-chunk decodes: only 621 / 3,276 pair
+   textures are fully known today.
