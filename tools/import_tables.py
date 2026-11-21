@@ -47,17 +47,18 @@ def import_window(path):
         slots = d["slots"]
         meta = {k: v for k, v in d.items() if k != "slots"}
     else:
+        src = d["slots"] if isinstance(d.get("slots"), dict) else d
         slots = [None] * 256
         meta = {}
-        for k, v in d.items():
+        for k, v in src.items():
             if not k.isdigit():
                 continue
             val = v.get("value") or v.get("joint")
             if val is None:
                 continue
             ent = {"value": [int(x) for x in val]}
-            for key in ("textures", "near", "blocks"):
-                if key in v and isinstance(v[key], (int, float)):
+            for key in ("textures", "near", "blocks", "rms", "halves_agree"):
+                if key in v and isinstance(v[key], (int, float, bool)):
                     ent[key] = v[key]
             if "per" in v and "textures" not in ent:
                 ent["textures"] = len(v["per"])

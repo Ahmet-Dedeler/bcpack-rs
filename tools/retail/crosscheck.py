@@ -24,7 +24,16 @@ SCR = os.path.join(os.environ.get("BCPACK_SCRATCH", tempfile.gettempdir()), "bcp
 os.makedirs(SCR, exist_ok=True)
 QT = json.load(open(os.path.join(os.environ["BCPACK_SEM_INDICES"], "quad_table.json")))["entries"]
 CODES = {e["sym"]: e["codes"] for e in QT}
-HIST = load_window(path=os.environ["BCPACK_WINDOW"])
+def _load_hist(path):
+    """Window JSON as written by the endpoint fit: {"slots": {slot: {"value": [...]}}} or {slot: {...}}."""
+    d = json.load(open(path))
+    src = d["slots"] if isinstance(d.get("slots"), dict) else d
+    W = [(0, 0, 0, 0, 0, 0)] * 256
+    for k, v in src.items():
+        if k.isdigit():
+            W[int(k)] = tuple(v.get("value") or v["joint"])
+    return W
+HIST = _load_hist(os.environ["BCPACK_WINDOW"])
 
 def qmask(q, s):
     oy, ox = [(0, 0), (0, 2), (2, 0), (2, 2)][q]

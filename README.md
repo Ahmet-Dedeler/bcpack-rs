@@ -6,13 +6,13 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1 decodes.** `bcpack decode-bc1` turns a BCPack BC1 chunk into plain BC1 blocks. The entropy layer is exact; two small tables in the block layer are fitted from data and one of them is incomplete, so some textures still decode with wrong colours in parts (see coverage).
+**BC1 decodes.** `bcpack decode-bc1` turns a BCPack BC1 chunk into plain BC1 blocks. The entropy layer is exact. The block layer uses two small constant tables fitted from data (a 256-slot preset endpoint window and a 256-entry index codebook); both are now essentially complete.
 
 | Part | Status |
 |---|---|
 | Entropy layer (rANS) | **Exact.** Microsoft's MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT), a clock-for-clock port of its lane decoder, bytes fed in lane order (8 per clock) with all 12 lanes in lockstep. Every lane must consume exactly its byte budget and end in a legal state, so a wrong rule fails loudly |
 | BC1 endpoints | **Verified.** Lane 0 is a back-reference "copy block *i − d*", lanes 2-7 add zigzag corrections to R0 G0 B0 R1 G1 B1. References before the chunk start read a fixed 256-entry preset window |
-| BC1 preset window | **Fitted, incomplete.** 16 of 256 slots fitted (the most used ones) (`data/bc1_window.json`); the rest decode as zero and the decoder reports how many blocks depend on them |
+| BC1 preset window | **Fitted.** 254 of 256 slots (`data/bc1_window.json`); slots 0 and 4 were never referenced in the fitting data. The decoder reports any block that depends on an unfitted slot |
 | BC1 indices | **Fitted.** Each 2x2 quadrant is a symbol into a fixed, frequency-ordered table of all 256 index patterns (`data/bc1_quad_table.json`). Two independent fits agree on 248/256 entries (99.76% of quadrants); 8 rare mirror pairs are uncertain |
 | BC1 block order | Standard Gfx10 tiled order (stream order = stored order) |
 | BC7 | Entropy layer solved (research branches): 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`. 4,600+ chunks converge exactly, 0 of 1,180 controls do. Block mapping (modes, partitions) in progress. Not in this decoder yet |
@@ -24,12 +24,12 @@ All measured on retail Xbox Series texture pools with the commands in [Reproduci
 
 | Check | Result |
 |---|---|
-| Exact convergence (`bcpack scan --every 20`, every 20th BC1 chunk of all 57 pools) | **5,162/5,162** chunks (97.9 M blocks): all 12 lanes end in a legal state with exactly `blocks` symbols, and the bytes consumed equal the stored length minus the pad in 5,162/5,162. 2,396 of them touch no unfitted preset-window slot |
+| Exact convergence (`bcpack scan --every 20`, every 20th BC1 chunk of all 57 pools) | **5,162/5,162** chunks (97.9 M blocks): all 12 lanes end in a legal state with exactly `blocks` symbols, and the bytes consumed equal the stored length minus the pad in 5,162/5,162. 5,161 touch no unfitted preset-window slot |
 | Rust vs the Python research pipeline (probe simulator + endpoint rule + codebook), byte for byte | **520/520** chunks identical, sampled round-robin across 52 stores (1,024-16,384 blocks), plus **12/12** chunks of 32,768-65,536 blocks |
-| Mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode. Textures touching no unfitted window slot (301): median **35.1 dB**, p10 25.3, p90 42.3; 28 below 25 dB. Textures that touch one (299): median 9.1 dB, i.e. mostly wrong colours. All 600: median 27.6, p10 7.3 (flat mean-colour baseline 22.6) |
+| Mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode, none touching an unfitted window slot. Median **35.4 dB**, p10 30.2, p90 41.8 (flat mean-colour baseline 22.6); 3 below 25 dB, 18 not at least 3 dB above flat. With only the first 16 window slots the same set scored median 27.6, p10 7.3 |
 | Speed | **34-40 MB/s of BC1 output per core** (4.3-5 M blocks/s, 25 MB/s compressed input), CPU time, `bcpack bench` on 4,096- and 65,536-block chunks. Chunks decode independently, so `scan` scales across cores (8 threads on a heavily shared machine: about 110 MB/s). Below the 50 MB/s per-core target |
 
-The plain-BC1 ceiling of the mip-consistency check is about 37.9 dB median; held-out fits of the codebook reach 36.1-36.6 dB on textures whose preset-window slots are all fitted.
+The plain-BC1 ceiling of the mip-consistency check is about 37.9 dB median. The 5 chunks the research simulator reported as non-converging decode here (see `docs/findings/decoder.md`).
 
 ### Research branches
 
