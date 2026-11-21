@@ -9,6 +9,13 @@ Shared outputs: `/tmp/bcpack-shared/bc1_index.jsonl` (102,725 lines),
 `/tmp/bcpack-shared/mip_pairs.jsonl` (194,143: 4,809 pairs + 189,334 controls),
 `/tmp/bcpack-shared/const_tables/` (constant-lane lookup tables, rebuilt automatically).
 
+**Scorer commit: `934e376`** (branch `harness`): mip pairs, Gfx10 detiling, controls passing,
+plus `mipscore.mip0_chunk_map(texture_id)` (chunk ids, byte and stored-order block ranges of
+mip 0, in order) and `mipscore.assemble_mip0(texture_id, {chunk_id: decoded_bytes})`
+(returns Gfx10 bytes and detiled row-major blocks). Checked: assembling a plain mip 0 through
+these helpers reproduces the positive-control PSNR exactly (42.93 dB on
+`data/ttdb/maps/ttdb_maps_1_7.ttpf:t4294`, via gfx10 and via linear).
+
 ## 1. Corpus (`python3 -I tools/bench/corpus.py`, then `--summary`)
 
 | codec | chunks |
