@@ -6,7 +6,7 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1 decodes.** The format is solved and checked on held-out textures. The fast Rust decoder is still being written; today the working pipeline is the Python research code on the branches listed below.
+**BC1 decodes.** The format is solved: 2,995 of 3,000 test textures decode fully. A held-out check of the preset window table is still running. The fast Rust decoder is still being written; today the working pipeline is the Python research code on the branches listed below.
 
 | Part | Status |
 |---|---|
@@ -15,9 +15,9 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 | BC1 indices | **Solved.** Each 2×2 quadrant is a symbol into a fixed, frequency-ordered table of all 256 index patterns. Two independent fits agree on 248/256 entries (99.76% of quadrants); 8 rare mirror pairs are still uncertain |
 | BC1 block order | Standard Gfx10 tiled order |
 | BC1 quality, held out | Fit on even stores, scored on odd: **36.6 dB** median vs the plain mip 1 (318/319 above baseline). Reverse split 36.1 dB. Plain BC1 ceiling is 37.9 dB. Fitting with no mip term at all still gives 35.0 dB, so the fit is not just learning the scorer |
-| BC1 coverage | Textures whose blocks only use fitted preset-window slots decode fully (621 of 3,276 in the first test set). Fitting the remaining slots is in progress |
-| BC7 | Entropy layer: 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`, 60/60 test chunks converge exactly; full corpus scan running. Block semantics (modes, partitions) not started |
-| BC3, BC4, BC5, BC6H | Not started |
+| BC1 coverage | The preset window is fully fitted (254/254 referenced slots). Full decode works on **2,995 of 3,000** test textures: median 34.4 dB vs the plain mip 1 (ceiling 37.9 dB), 2,641 at 30 dB or more. Held-out check of the window table pending |
+| BC7 | Entropy layer solved: 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`. 4,600+ chunks converge exactly, 0 of 1,180 controls do. Block mapping (modes, partitions) in progress |
+| BC6H, BC5, BC4, BC3 | Entropy layer solved: every chunk in the corpus converges exactly. Block mappings in progress |
 
 ### Research branches
 
