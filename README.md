@@ -1,30 +1,48 @@
 # bcpack-rs
 
-Work-in-progress reverse engineering of **BCPack**, the rANS entropy codec that the Xbox Series X|S Media Decompression Unit (MDU) uses for block-compressed (`BC1`–`BC7`) textures. Rust crate + CLI, a stdlib-only Python port, and a written spec.
+Reverse engineering of **BCPack**, the rANS entropy codec that the Xbox Series X|S Media Decompression Unit (MDU) uses for block-compressed (`BC1`–`BC7`) textures. Rust crate + CLI, a stdlib-only Python port, and a written spec.
 
 Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all tests use synthetic streams.
 
 ## Status
 
-**This does not decode textures yet.** What is verified and what is not:
+**BC1 decodes.** The format is solved and checked on held-out textures. The fast Rust decoder is still being written; today the working pipeline is the Python research code on the branches listed below.
 
 | Part | Status |
 |---|---|
-| Fragment header bitfields (`z`, `hdr3`, `flush_per_frag`, `q`) and the 2-byte vs 3-byte length forms | Verified: parsed fragment byte budgets add up exactly to the compressed size of real multi-fragment BC1 chunks |
-| Power-of-two segmented static models, slot-0 reservation, legal end states `{L, L>>8, L>>16}` | Taken from the public patent (`US11234023B2`, Fig. 15) and consistent with every single-symbol fragment observed |
-| Constant-lane and 1-symbol prefix (`0x10`/`0x50`/`0x90`/`0xd0`) fragments | Verified: all 7,162 observed `len == 4` fragments end in a legal state. These are the trivial cases (one symbol or a constant lane) |
-| Exponential decay schedule `λ(q)` for the 16 models | Fitted to the frequency tables observed so far, not confirmed for every `(eab, q)` pair |
-| Multi-symbol lanes, lane interleaving schedule, BC1 block reassembly | **Not working.** `bcpack decode-bc1` runs on real chunks but its output is not valid BC1 (index words are mostly zero in the top bits), so the lane schedule or symbol-to-block mapping is still wrong |
-| BC3–BC7 | Lane layouts in the spec are guesses; nothing is decoded |
+| Entropy layer (rANS) | **Solved.** Microsoft's exact MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT). Bytes are fed in lane order with all lanes in lockstep, and every lane must end in a legal state, so a wrong guess fails loudly |
+| BC1 endpoints | **Solved.** Lane 0 is a back-reference "copy block *i − d*", lanes 2–7 add zigzag corrections to R0 G0 B0 R1 G1 B1. References before the chunk start read a fixed 256-entry preset window |
+| BC1 indices | **Solved.** Each 2×2 quadrant is a symbol into a fixed, frequency-ordered table of all 256 index patterns. Two independent fits agree on 248/256 entries (99.76% of quadrants); 8 rare mirror pairs are still uncertain |
+| BC1 block order | Standard Gfx10 tiled order |
+| BC1 quality, held out | Fit on even stores, scored on odd: **36.6 dB** median vs the plain mip 1 (318/319 above baseline). Reverse split 36.1 dB. Plain BC1 ceiling is 37.9 dB. Fitting with no mip term at all still gives 35.0 dB, so the fit is not just learning the scorer |
+| BC1 coverage | Textures whose blocks only use fitted preset-window slots decode fully (621 of 3,276 in the first test set). Fitting the remaining slots is in progress |
+| BC7 | Entropy layer solved: 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`, 60/60 test chunks converge exactly. Mode / partition mapping not done yet |
+| BC3, BC4, BC5, BC6H | Not started |
 
-If you know the MDU lane schedule or have a known plaintext/compressed BC1 pair, issues and PRs are very welcome.
+### Research branches
+
+The work happened in parallel branches. Each has a findings doc in `docs/findings/`.
+
+| Branch | What it holds |
+|---|---|
+| `patent` | Reference decoder with tables generated from Microsoft's `mdu_minirans.v`, patent (`US11234023B2`) notes |
+| `prior-work` | Public BCPack facts collected from other projects, with contradictions noted |
+| `probe` | Cycle-level multi-lane MDU simulator, BC1 convergence scan over 15,000 chunks |
+| `harness` | Shared test bench: corpus index, convergence oracle, mip-consistency scorer |
+| `sem-indices` | The 256-entry quadrant index codebook (`tools/sem/quad_table.json`) and its held-out checks |
+| `sem-endpoints` | Endpoint rule, preset-window fitter, full BC1 decode + scoring |
+| `other-formats` | BC7 entropy layer |
+
+None of the branches contain game files or decoded textures. Scripts read textures from your own copy at run time.
+
+Credits: Microsoft `silicon-rans` (MIT) for the rANS tables, and the SixNG and Xbox2Windows communities for prior format notes.
 
 ## Layout
 
 - `src/lib.rs` – rANS lane decoder state machine, static model tables, fragment header parser
-- `src/main.rs` – `bcpack inspect <chunk>` (dump lane and fragment headers) and `bcpack decode-bc1` (experimental, see status)
+- `src/main.rs` – `bcpack inspect <chunk>` (dump lane and fragment headers) and `bcpack decode-bc1` (an early guess at the lane schedule that does not produce valid BC1; it is being replaced by the solved decoder)
 - `python/bcpack.py` – the same decoder in pure Python (runs under `python -I`)
-- [`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md) – format notes, with the evidence behind each claim
+- [`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md) – early format notes. Parts of it predate the solved layout; the findings docs on the research branches are current
 
 ## Tests
 
