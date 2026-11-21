@@ -25,6 +25,7 @@ import ttpf  # noqa: E402
 import mipscore  # noqa: E402
 
 SCR = os.environ.get("SEM_SCRATCH", "/tmp/bcpack-sem-indices")
+RING = "--ring" in sys.argv   # store the 4x4 mip-1 window around each block instead (quadring_*.npz)
 
 
 def placement(texture_id, nblocks, order):
@@ -55,6 +56,8 @@ def job(args):
     except Exception as e:  # noqa: BLE001
         return None
     rgb = np.zeros((n, 4, 3), np.uint8)
+    ring = np.zeros((n, 4, 4, 3), np.uint8) if RING else None
+    refa = np.array(ref, np.uint8).reshape(h1, w1, 3) if RING else None
     valid = np.zeros(n, bool)
     pos = np.full(n, -1, np.int32)
     for i, (x, y) in enumerate(xy):
@@ -64,13 +67,18 @@ def job(args):
         pos[i] = (y << 16) | x
         rgb[i, 0] = ref[2 * y][2 * x]; rgb[i, 1] = ref[2 * y][2 * x + 1]
         rgb[i, 2] = ref[2 * y + 1][2 * x]; rgb[i, 3] = ref[2 * y + 1][2 * x + 1]
-    return int(os.path.basename(f)[:5]), syms.astype(np.int16), rgb, valid, pos
+        if RING:
+            ys = np.clip(np.arange(2 * y - 1, 2 * y + 3), 0, h1 - 1)
+            xs = np.clip(np.arange(2 * x - 1, 2 * x + 3), 0, w1 - 1)
+            ring[i] = refa[ys][:, xs]
+    return int(os.path.basename(f)[:5]), syms.astype(np.int16), (ring if RING else rgb), valid, pos
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--order", default="gfx10")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--ring", action="store_true")
     a = ap.parse_args()
     fs = sorted(glob.glob(os.path.join(SCR, "syms", "*.npz")))
     if a.limit:
@@ -83,7 +91,7 @@ def main():
             t, s, rgb, v, pos = r
             S.append(s); R.append(rgb); V.append(v); P.append(pos)
             T.append(np.full(s.shape[1], t, np.int32))
-    np.savez(os.path.join(SCR, "quad_%s.npz" % a.order), syms=np.concatenate(S, 1),
+    np.savez(os.path.join(SCR, ("quadring_%s.npz" if RING else "quad_%s.npz") % a.order), syms=np.concatenate(S, 1),
              rgb=np.concatenate(R), valid=np.concatenate(V), tex=np.concatenate(T),
              pos=np.concatenate(P))
     print(len(S), sum(len(v) for v in V))
