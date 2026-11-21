@@ -16,7 +16,7 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 | BC1 block order | Standard Gfx10 tiled order |
 | BC1 quality, held out | Fit on even stores, scored on odd: **36.6 dB** median vs the plain mip 1 (318/319 above baseline). Reverse split 36.1 dB. Plain BC1 ceiling is 37.9 dB. Fitting with no mip term at all still gives 35.0 dB, so the fit is not just learning the scorer |
 | BC1 coverage | Textures whose blocks only use fitted preset-window slots decode fully (621 of 3,276 in the first test set). Fitting the remaining slots is in progress |
-| BC7 | Entropy layer solved: 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`, 60/60 test chunks converge exactly. Mode / partition mapping not done yet |
+| BC7 | Entropy layer: 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`, 60/60 test chunks converge exactly; full corpus scan running. Block semantics (modes, partitions) not started |
 | BC3, BC4, BC5, BC6H | Not started |
 
 ### Research branches
