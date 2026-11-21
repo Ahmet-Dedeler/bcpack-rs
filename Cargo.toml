@@ -14,11 +14,19 @@ path = "src/lib.rs"
 [[bin]]
 name = "bcpack"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# RDS5 (.ttpf) store reader, Gfx10 detiling, whole-texture decode and PNG output.
+ttpf = ["dep:flate2", "dep:png"]
+# The `bcpack` command-line tool.
+cli = ["ttpf", "dep:rayon"]
 
 [dependencies]
-flate2 = "1.1"
-png = "0.17"
-rayon = "1.10"
+flate2 = { version = "1.1", optional = true }
+png = { version = "0.18", optional = true }
+rayon = { version = "1.10", optional = true }
 serde_json = "1.0"
 
 [dev-dependencies]

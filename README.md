@@ -70,6 +70,14 @@ let quads = bcpack::bc1::QuadTable::default_table();
 let out = bcpack::bc1::decode(&chunk, blocks, &window, &quads)?;   // out.blocks: blocks * 8 bytes
 ```
 
+To embed only the decoder, turn off the default features. The library then depends on `serde_json` alone:
+
+```toml
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", default-features = false }
+```
+
+Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`). `cli` (default) adds the `bcpack` tool on top (`rayon`).
+
 Python reference (slow, readable): `python3 -I python/bcpack.py decode-bc1 chunk.bin 4096 out.bc1`.
 
 ## Layout
