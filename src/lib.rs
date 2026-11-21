@@ -413,6 +413,8 @@ pub struct RansLane {
     pub done: bool,
     pub decoded_symbols: Vec<u16>,
     pub fragments: Vec<FragmentHeader>,
+    /// Bytes this lane pulled from the shared stream (bench instrumentation).
+    pub bytes_read: usize,
     hdr0_byte: u8,
     hdr1_byte: u8,
 }
@@ -439,6 +441,7 @@ impl RansLane {
             done: false,
             decoded_symbols: Vec::with_capacity(out_target),
             fragments: Vec::new(),
+            bytes_read: 0,
             hdr0_byte: 0,
             hdr1_byte: 0,
         }
@@ -493,6 +496,7 @@ impl RansLane {
         if self.need_ib_load() && *pos < stream.len() {
             self.input_buf = stream[*pos];
             self.input_buf_full = true;
+            self.bytes_read += 1;
             *pos += 1;
         }
     }
@@ -756,6 +760,19 @@ pub fn decode_multilane_stream(
     alphabet_bits: &[u8],
     symbols_per_lane: usize,
 ) -> Result<Vec<RansLane>, &'static str> {
+    match decode_multilane_stream_traced(stream, alphabet_bits, symbols_per_lane)? {
+        (lanes, true) => Ok(lanes),
+        _ => Err("multi-lane stream did not finish within max_rounds"),
+    }
+}
+
+/// Same as [`decode_multilane_stream`] but also returns the lanes when the decode did
+/// not finish (`false`), so a test bench can report per-lane partial traces.
+pub fn decode_multilane_stream_traced(
+    stream: &[u8],
+    alphabet_bits: &[u8],
+    symbols_per_lane: usize,
+) -> Result<(Vec<RansLane>, bool), &'static str> {
     if alphabet_bits.len() < 8 {
         return Err("at least 8 lanes required");
     }
@@ -795,7 +812,7 @@ pub fn decode_multilane_stream(
                     l.decoded_symbols.push(l.sym_buf);
                 }
             }
-            return Ok(lanes);
+            return Ok((lanes, true));
         }
     }
     // Flush final buffered symbol if all lanes completed output_remaining == 0
@@ -806,9 +823,9 @@ pub fn decode_multilane_stream(
                 l.sym_buf_full = false;
             }
         }
-        return Ok(lanes);
+        return Ok((lanes, true));
     }
-    Err("multi-lane stream did not finish within max_rounds")
+    Ok((lanes, false))
 }
 
 /// Assemble 8-byte BC1 blocks from the 12 decoded BC1 lanes:

@@ -1,5 +1,5 @@
 use bcpack::{
-    assemble_bc1_blocks, decode_multilane_stream, extract_main_lane_record, is_legal_end_state,
+    assemble_bc1_blocks, decode_multilane_stream, decode_multilane_stream_traced, extract_main_lane_record, is_legal_end_state,
     parse_main_8lane_header, BcFormat, ProbabilityModel,
 };
 use std::env;
@@ -10,7 +10,8 @@ fn print_usage() {
     eprintln!(
         "Usage:
   bcpack inspect <stream.bin> [--codec <hex_id>] [--blocks <N>]
-  bcpack decode-bc1 <stream.bin> <out.bc1> <num_blocks>"
+  bcpack decode-bc1 <stream.bin> <out.bc1> <num_blocks>
+  bcpack trace <stream.bin> <num_blocks>   (per-lane JSON trace for tools/bench/oracle.py)"
     );
 }
 
@@ -84,6 +85,45 @@ fn main() {
                     );
                 }
             }
+        }
+        "trace" => {
+            // One JSON object on stdout: per-lane bytes consumed, declared budget
+            // (sum of fragment header + payload bytes), final state, symbol count.
+            if args.len() < 4 {
+                print_usage();
+                process::exit(1);
+            }
+            let data = fs::read(&args[2]).unwrap_or_else(|e| {
+                eprintln!("Failed to read {}: {e}", args[2]);
+                process::exit(1);
+            });
+            let num_blocks: usize = args[3].parse().unwrap_or_else(|_| {
+                eprintln!("Invalid num_blocks");
+                process::exit(1);
+            });
+            let abs = BcFormat::Bc1.lane_alphabet_bits();
+            let (lanes, finished) = decode_multilane_stream_traced(&data, abs, num_blocks).unwrap_or_else(|e| {
+                eprintln!("Decode error: {e}");
+                process::exit(2);
+            });
+            let mut parts = Vec::new();
+            for (i, l) in lanes.iter().enumerate() {
+                let budget: usize = l.fragments.iter().map(|f| f.header_bytes + f.payload_bytes).sum();
+                let frags: Vec<String> = l
+                    .fragments
+                    .iter()
+                    .map(|f| format!("{{\"mode\":{},\"len\":{}}}", f.raw_mode, f.payload_bytes))
+                    .collect();
+                parts.push(format!(
+                    "{{\"lane\":{i},\"bytes_consumed\":{},\"budget\":{budget},\"final_state\":{},\"n_symbols\":{},\"done\":{},\"fragments\":[{}]}}",
+                    l.bytes_read,
+                    l.rans_state_p0,
+                    l.decoded_symbols.len(),
+                    l.done,
+                    frags.join(",")
+                ));
+            }
+            println!("{{\"finished\":{finished},\"lanes\":[{}]}}", parts.join(","));
         }
         "decode-bc1" => {
             if args.len() < 5 {
