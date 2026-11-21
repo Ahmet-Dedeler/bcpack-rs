@@ -61,7 +61,7 @@ class Lane:
 
 
 def simulate(stream, alphabet_bits, out_targets, window=8, symvec="lockstep",
-             max_cycles=None, stream_len=None):
+             max_cycles=None, stream_len=None, order=None):
     n = len(alphabet_bits)
     lanes = [Lane(i, alphabet_bits[i], out_targets[i]) for i in range(n)]
     slots = [False] * n
@@ -70,12 +70,13 @@ def simulate(stream, alphabet_bits, out_targets, window=8, symvec="lockstep",
     end = len(stream) if stream_len is None else stream_len
     cycle = 0
     vectors = 0
+    last_prog, last_change = None, 0
     if max_cycles is None:
         max_cycles = 64 * (sum(out_targets) + end) + 1000
     while cycle < max_cycles:
         # ---------------- PHASE 0 ----------------
         served = 0
-        for ln in lanes:
+        for ln in (lanes if order is None else [lanes[i] for i in order]):
             sym_ready = not slots[ln.idx]
             blocked_out = ln.sym_full and not sym_ready
             need = ln.need_ib_load()
@@ -206,6 +207,11 @@ def simulate(stream, alphabet_bits, out_targets, window=8, symvec="lockstep",
                     slots[i] = False
                 vectors += 1
         cycle += 1
+        prog = (pos, sum(len(l.syms) for l in lanes), sum(l.state for l in lanes))
+        if prog != last_prog:
+            last_prog, last_change = prog, cycle
+        elif cycle - last_change > 64:
+            return finish(lanes, pos, end, cycle, vectors, "deadlock")
         if all(ln.done and not ln.sym_full for ln in lanes):
             # flush final symbols in slots
             return finish(lanes, pos, end, cycle, vectors, "all_done")

@@ -50,12 +50,15 @@ class LambdaModel:
 def run(job):
     path, idx, off, size, blocks, target_mode, variant = job
     import mdusim
-    window, symvec, dN, flip = 8, "lockstep", 0, None
+    window, symvec, dN, flip, split, order = 8, "lockstep", 0, None, 1, None
     for v in variant.split(","):
         if v.startswith("window="): window = int(v[7:])
         elif v.startswith("symvec="): symvec = v[7:]
         elif v.startswith("dN="): dN = int(v[3:])
         elif v.startswith("flip="): flip = float(v[5:])
+        elif v.startswith("split="): split = int(v[6:])
+        elif v == "order=rev": order = list(range(11, -1, -1))
+        elif v == "order=sec-first": order = [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7]
         elif v == "lambda": mdusim.Model = LambdaModel
     with open(path, "rb") as f:
         f.seek(off)
@@ -64,16 +67,26 @@ def run(job):
     if flip is not None:
         d = bytearray(d); d[min(max(sl - 1, 0), int(sl * flip))] ^= 0x01; d = bytes(d)
     N = blocks if target_mode == "blocks" else target_mode
-    N += dN
-    r = simulate(d, BC1_AB, [N] * 12, stream_len=size, window=window, symvec=symvec,
-                 max_cycles=40 * (12 * N + size) + 1000)
-    ok_done = all(l["done"] for l in r["lanes"])
-    ok_legal = all(l["final"] in LEGAL for l in r["lanes"])
-    ok_len = sl <= r["pos"] <= size
+    N = N // split + dN
+    pos = 0
+    ok_done = ok_legal = True
+    why = []
+    nfr = []
+    for k in range(split):
+        r = simulate(d[pos:], BC1_AB, [N] * 12, stream_len=size - pos, window=window,
+                     symvec=symvec, order=order, max_cycles=40 * (12 * N + size) + 1000)
+        pos += r["pos"]
+        ok_done &= all(l["done"] for l in r["lanes"])
+        ok_legal &= all(l["final"] in LEGAL for l in r["lanes"])
+        why.append(r["why"])
+        nfr.append([len(l["frags"]) for l in r["lanes"]])
+        if not ok_done:
+            break
+    r = dict(pos=pos, why="/".join(why), lanes=[dict(done=ok_done, frags=[])] * 12)
+    ok_len = sl <= pos <= size
     return dict(store=os.path.basename(path), idx=idx, blocks=blocks, size=size, sl=sl,
                 pos=r["pos"], why=r["why"], done=ok_done, legal=ok_legal, lenok=ok_len,
-                ndone=sum(l["done"] for l in r["lanes"]),
-                nfr=[len(l["frags"]) for l in r["lanes"]],
+                nfr=nfr,
                 passed=ok_done and ok_legal and ok_len)
 
 
@@ -81,6 +94,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("stores", nargs="+")
     ap.add_argument("--max-blocks", type=int, default=16384)
+    ap.add_argument("--min-blocks", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--target", default="blocks")
     ap.add_argument("--variant", default="", help="comma list: window=K symvec=free dN=D flip=F lambda")
@@ -90,7 +104,7 @@ if __name__ == "__main__":
     jobs = []
     for p in args.stores:
         for i, codec, mm, off, size, blocks in iter_chunks(p):
-            if blocks <= args.max_blocks:
+            if args.min_blocks <= blocks <= args.max_blocks:
                 jobs.append((p, i, off, size, blocks, tm, args.variant))
     if args.limit:
         step = max(1, len(jobs) // args.limit)
