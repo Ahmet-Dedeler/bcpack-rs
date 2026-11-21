@@ -40,16 +40,23 @@ impl Window {
     /// Parse `{"slots": [null | {"value": [r0,g0,b0,r1,g1,b1], ...}, x256]}`.
     pub fn from_json(text: &str) -> Result<Window, String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let arr = v["slots"].as_array().ok_or("window: missing \"slots\" array")?;
+        let arr = v["slots"]
+            .as_array()
+            .ok_or("window: missing \"slots\" array")?;
         if arr.len() != 256 {
             return Err(format!("window: {} slots, need 256", arr.len()));
         }
-        let mut w = Window { slots: [[0; 6]; 256], fitted: [false; 256] };
+        let mut w = Window {
+            slots: [[0; 6]; 256],
+            fitted: [false; 256],
+        };
         for (s, e) in arr.iter().enumerate() {
             if e.is_null() {
                 continue;
             }
-            let val = e["value"].as_array().ok_or("window: slot without \"value\"")?;
+            let val = e["value"]
+                .as_array()
+                .ok_or("window: slot without \"value\"")?;
             if val.len() != 6 {
                 return Err(format!("window: slot {s} has {} fields", val.len()));
             }
@@ -106,7 +113,9 @@ impl QuadTable {
     /// Parse `{"entries": [{"sym": s, "codes": [tl, tr, bl, br]}, ...]}`.
     pub fn from_json(text: &str) -> Result<QuadTable, String> {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let arr = v["entries"].as_array().ok_or("quad table: missing \"entries\"")?;
+        let arr = v["entries"]
+            .as_array()
+            .ok_or("quad table: missing \"entries\"")?;
         let mut codes = [[0u8; 4]; 256];
         let mut seen = [false; 256];
         for e in arr {
@@ -173,7 +182,14 @@ pub struct Bc1Output {
 pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Output {
     let n = lanes.target;
     let l0 = lanes.lane(0);
-    let res: [&[u16]; 6] = [lanes.lane(2), lanes.lane(3), lanes.lane(4), lanes.lane(5), lanes.lane(6), lanes.lane(7)];
+    let res: [&[u16]; 6] = [
+        lanes.lane(2),
+        lanes.lane(3),
+        lanes.lane(4),
+        lanes.lane(5),
+        lanes.lane(6),
+        lanes.lane(7),
+    ];
     let idx: [&[u16]; 4] = [lanes.lane(8), lanes.lane(9), lanes.lane(10), lanes.lane(11)];
     let mut fields: Vec<[u8; 6]> = vec![[0; 6]; n];
     let mut tainted: Vec<bool> = vec![false; n];
@@ -210,7 +226,11 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
         o[2..4].copy_from_slice(&c1.to_le_bytes());
         o[4..8].copy_from_slice(&w.to_le_bytes());
     }
-    Bc1Output { blocks: out, unfitted_blocks: unfitted, prestart_refs: prestart }
+    Bc1Output {
+        blocks: out,
+        unfitted_blocks: unfitted,
+        prestart_refs: prestart,
+    }
 }
 
 /// Decode the 12 lane symbol streams of a BCPack BC1 chunk.
@@ -219,7 +239,12 @@ pub fn decode_symbols(chunk: &[u8], blocks: usize) -> Result<LaneOutput, DecodeE
 }
 
 /// BCPack BC1 chunk bytes + block count -> BC1 blocks (stream / Gfx10 order).
-pub fn decode(chunk: &[u8], blocks: usize, window: &Window, quads: &QuadTable) -> Result<Bc1Output, DecodeError> {
+pub fn decode(
+    chunk: &[u8],
+    blocks: usize,
+    window: &Window,
+    quads: &QuadTable,
+) -> Result<Bc1Output, DecodeError> {
     let lanes = decode_symbols(chunk, blocks)?;
     Ok(assemble(&lanes, window, quads))
 }

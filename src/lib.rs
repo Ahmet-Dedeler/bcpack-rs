@@ -85,5 +85,14 @@ pub fn texture_mip0(
         gfx10.extend_from_slice(&bytes[f as usize..e as usize]);
     }
     let (blocks, bw, bh) = ttpf::detile_bc1(&gfx10, p0, tex.tile_mode);
-    Ok(Mip0 { blocks, bw, bh, width: p0.w, height: p0.h, gfx10, bcpack_chunks: nbc, unfitted_blocks: unfitted })
+    Ok(Mip0 {
+        blocks,
+        bw,
+        bh,
+        width: p0.w,
+        height: p0.h,
+        gfx10,
+        bcpack_chunks: nbc,
+        unfitted_blocks: unfitted,
+    })
 }

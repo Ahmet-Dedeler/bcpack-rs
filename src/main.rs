@@ -53,7 +53,11 @@ fn parse(args: &[String]) -> Opts {
         emit: None,
     };
     let mut i = 0;
-    let val = |i: usize| args.get(i + 1).cloned().unwrap_or_else(|| die(format!("{} needs a value", args[i])));
+    let val = |i: usize| {
+        args.get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| die(format!("{} needs a value", args[i])))
+    };
     while i < args.len() {
         match args[i].as_str() {
             "--window" => {
@@ -71,7 +75,10 @@ fn parse(args: &[String]) -> Opts {
                 i += 2;
             }
             "--every" => {
-                o.every = val(i).parse::<usize>().unwrap_or_else(|_| die("bad --every")).max(1);
+                o.every = val(i)
+                    .parse::<usize>()
+                    .unwrap_or_else(|_| die("bad --every"))
+                    .max(1);
                 i += 2;
             }
             "--max-blocks" => {
@@ -119,7 +126,12 @@ fn cmd_decode(o: &Opts) {
     }
     let (blocks, out) = match o.pos[1].parse::<usize>() {
         Ok(b) => (b, &o.pos[2]),
-        Err(_) => (o.pos[2].parse().unwrap_or_else(|_| die("blocks must be a number")), &o.pos[1]),
+        Err(_) => (
+            o.pos[2]
+                .parse()
+                .unwrap_or_else(|_| die("blocks must be a number")),
+            &o.pos[1],
+        ),
     };
     let data = read(&o.pos[0]);
     let r = bc1::decode(&data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
@@ -135,9 +147,16 @@ fn cmd_symbols(o: &Opts) {
         die("usage: bcpack symbols <chunk.bin> <blocks>");
     }
     let data = read(&o.pos[0]);
-    let blocks = o.pos[1].parse().unwrap_or_else(|_| die("blocks must be a number"));
+    let blocks = o.pos[1]
+        .parse()
+        .unwrap_or_else(|_| die("blocks must be a number"));
     let r = bc1::decode_symbols(&data, blocks).unwrap_or_else(|e| die(e));
-    eprintln!("consumed {} of {} bytes in {} cycles", r.consumed, data.len(), r.cycles);
+    eprintln!(
+        "consumed {} of {} bytes in {} cycles",
+        r.consumed,
+        data.len(),
+        r.cycles
+    );
     for l in 0..12 {
         let s: Vec<String> = r.lane(l).iter().map(|v| v.to_string()).collect();
         println!("{}", s.join(" "));
@@ -149,9 +168,13 @@ fn cmd_export(o: &Opts) {
         die("usage: bcpack ttpf-export <store.ttpf> <texture_index> <out.dds|out.png>");
     }
     let store = ttpf::Store::open(Path::new(&o.pos[0])).unwrap_or_else(|e| die(e));
-    let ti: usize = o.pos[1].parse().unwrap_or_else(|_| die("texture index must be a number"));
+    let ti: usize = o.pos[1]
+        .parse()
+        .unwrap_or_else(|_| die("texture index must be a number"));
     let texs = store.textures().unwrap_or_else(|e| die(e));
-    let tex = texs.get(ti).unwrap_or_else(|| die(format!("store has {} textures", texs.len())));
+    let tex = texs
+        .get(ti)
+        .unwrap_or_else(|| die(format!("store has {} textures", texs.len())));
     let m = bcpack::texture_mip0(&store, tex, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     let out = &o.pos[2];
     let bytes = if out.to_ascii_lowercase().ends_with(".png") {
@@ -202,7 +225,10 @@ fn cmd_scan(o: &Opts) {
     if o.pos.is_empty() {
         die("usage: bcpack scan [--jobs N] [--every K] <store.ttpf>...");
     }
-    rayon::ThreadPoolBuilder::new().num_threads(o.jobs).build_global().ok();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(o.jobs)
+        .build_global()
+        .ok();
     if let Some(d) = &o.emit {
         std::fs::create_dir_all(d).unwrap_or_else(|e| die(e));
     }
@@ -219,17 +245,25 @@ fn cmd_scan(o: &Opts) {
         let ids: Vec<usize> = store
             .chunks
             .iter()
-            .filter(|c| c.codec == ttpf::CODEC_BC1 && c.vlen >= 8 && (c.vlen / 8) as usize <= o.max_blocks)
+            .filter(|c| {
+                c.codec == ttpf::CODEC_BC1 && c.vlen >= 8 && (c.vlen / 8) as usize <= o.max_blocks
+            })
             .map(|c| c.index)
             .step_by(o.every)
             .collect();
-        let stem = Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let stem = Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
         let tallies: Vec<Tally> = ids
             .par_iter()
             .map(|&ci| {
                 let c = &store.chunks[ci];
                 let blocks = (c.vlen / 8) as usize;
-                let mut t = Tally { chunks: 1, ..Default::default() };
+                let mut t = Tally {
+                    chunks: 1,
+                    ..Default::default()
+                };
                 let raw = match store.chunk_bytes(ci, true) {
                     Ok(r) => r,
                     Err(e) => {
@@ -298,7 +332,7 @@ fn cmd_scan(o: &Opts) {
     }
     if total.secs > 0.0 {
         println!(
-            "decode time {:.2} s (thread sum): {:.1} MB/s compressed in, {:.1} MB/s BC1 out per thread; wall {:.1} s",
+            "decode wall time summed over chunks {:.2} s: {:.1} MB/s compressed in, {:.1} MB/s BC1 out per thread; total wall {:.1} s (incl. reading stores)",
             total.secs,
             total.in_bytes as f64 / total.secs / 1e6,
             total.blocks as f64 * 8.0 / total.secs / 1e6,
@@ -334,7 +368,9 @@ fn cmd_bench(o: &Opts) {
         die("usage: bcpack bench <chunk.bin> <blocks> [seconds]");
     }
     let data = read(&o.pos[0]);
-    let blocks: usize = o.pos[1].parse().unwrap_or_else(|_| die("blocks must be a number"));
+    let blocks: usize = o.pos[1]
+        .parse()
+        .unwrap_or_else(|_| die("blocks must be a number"));
     let secs: f64 = o.pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
     let _ = bc1::decode(&data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     let t0 = Instant::now();

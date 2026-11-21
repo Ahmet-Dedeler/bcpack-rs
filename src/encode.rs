@@ -63,7 +63,10 @@ pub fn encode_fragment(alphabet_bits: u8, frag: &Fragment) -> Result<Vec<u8>, St
         }
         let (f, cf) = m.forward(s);
         if f == 0 {
-            return Err(format!("symbol {s} has zero frequency in model eab {eab} q {}", frag.q));
+            return Err(format!(
+                "symbol {s} has zero frequency in model eab {eab} q {}",
+                frag.q
+            ));
         }
         let x_max = (f as u64) << 16;
         while x >= x_max {
@@ -104,9 +107,19 @@ impl ByteSource for PerLane {
 }
 
 /// Interleave per-lane byte streams into the single stream the decoder reads.
-pub fn interleave(alphabet_bits: &[u8], target: usize, lane_bytes: &[Vec<u8>]) -> Result<Vec<u8>, DecodeError> {
+pub fn interleave(
+    alphabet_bits: &[u8],
+    target: usize,
+    lane_bytes: &[Vec<u8>],
+) -> Result<Vec<u8>, DecodeError> {
     let total: usize = lane_bytes.iter().map(|v| v.len()).sum();
-    let mut src = PerLane { queues: lane_bytes.iter().map(|v| v.iter().copied().collect()).collect(), order: vec![] };
+    let mut src = PerLane {
+        queues: lane_bytes
+            .iter()
+            .map(|v| v.iter().copied().collect())
+            .collect(),
+        order: vec![],
+    };
     rans::decode_lanes(&mut src, alphabet_bits, target, total)?;
     if src.queues.iter().any(|q| !q.is_empty()) {
         return Err(DecodeError::Invalid("a lane left bytes unread".into()));
@@ -184,7 +197,11 @@ pub fn synthetic_bc1(seed: u64, blocks: usize, max_frag: usize) -> (Vec<u8>, Vec
         let mut left = blocks;
         while left > 0 {
             let n = left.min(1 + rng.below(max_frag as u64) as usize);
-            let z = if rng.below(4) == 0 { rng.below(a as u64 + 1).min(3) as u8 } else { 0 };
+            let z = if rng.below(4) == 0 {
+                rng.below(a as u64 + 1).min(3) as u8
+            } else {
+                0
+            };
             let eab = header_model(a, z).unwrap();
             let q = rng.below(16) as u8;
             let s: Vec<u16> = (0..n).map(|_| sample_symbol(&mut rng, eab, q)).collect();

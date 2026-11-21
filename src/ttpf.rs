@@ -105,7 +105,12 @@ impl Store {
                 codec: ((a >> 24) & 0x3F) as u8,
             });
         }
-        Ok(Store { data, vsize, chunks, etpf_off })
+        Ok(Store {
+            data,
+            vsize,
+            chunks,
+            etpf_off,
+        })
     }
 
     /// Stored bytes of a chunk (with the trailing pad when `with_pad`).
@@ -113,7 +118,9 @@ impl Store {
         let c = &self.chunks[i];
         let len = if with_pad { c.file_len } else { c.data_len() };
         let (a, b) = (c.file_off as usize, (c.file_off + len) as usize);
-        self.data.get(a..b).ok_or_else(|| bad(format!("chunk {i} past end of file")))
+        self.data
+            .get(a..b)
+            .ok_or_else(|| bad(format!("chunk {i} past end of file")))
     }
 
     /// Unpacked bytes of a plain (stored or zlib) chunk.
@@ -130,7 +137,11 @@ impl Store {
             x => return Err(bad(format!("chunk {i}: codec {x:#x} is not plain"))),
         };
         if (out.len() as u64) < c.vlen {
-            return Err(bad(format!("chunk {i}: {} bytes < vlen {}", out.len(), c.vlen)));
+            return Err(bad(format!(
+                "chunk {i}: {} bytes < vlen {}",
+                out.len(),
+                c.vlen
+            )));
         }
         out.truncate(c.vlen as usize);
         Ok(out)
@@ -172,7 +183,8 @@ impl Store {
             .map(|i| {
                 let o = desc + 16 * i;
                 let (d0, d1, d2) = (u32le(d, o), u32le(d, o + 4), u32le(d, o + 8));
-                let h = u32le(d, hashes + 8 * i) as u64 | (u32le(d, hashes + 8 * i + 4) as u64) << 32;
+                let h =
+                    u32le(d, hashes + 8 * i) as u64 | (u32le(d, hashes + 8 * i + 4) as u64) << 32;
                 Texture {
                     index: i,
                     hash: h,
@@ -303,7 +315,16 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
                 return None;
             }
             let (lw, lh) = px(i);
-            levels[i as usize] = Some(Place { w: lw, h: lh, off: 0, len: tile_bytes, pw: tw, ph: th, ox: ox * 4, oy: oy * 4 });
+            levels[i as usize] = Some(Place {
+                w: lw,
+                h: lh,
+                off: 0,
+                len: tile_bytes,
+                pw: tw,
+                ph: th,
+                ox: ox * 4,
+                oy: oy * 4,
+            });
         }
     }
     for i in (0..tail).rev() {
@@ -311,7 +332,16 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
         let (nx, ny) = (ew.div_ceil(bw), eh.div_ceil(bh));
         let ln = nx as u64 * ny as u64 * tile_bytes;
         let (lw, lh) = px(i);
-        levels[i as usize] = Some(Place { w: lw, h: lh, off: pos, len: ln, pw: nx * tw, ph: ny * th, ox: 0, oy: 0 });
+        levels[i as usize] = Some(Place {
+            w: lw,
+            h: lh,
+            off: pos,
+            len: ln,
+            pw: nx * tw,
+            ph: ny * th,
+            ox: 0,
+            oy: 0,
+        });
         pos += ln;
     }
     Some((levels.into_iter().map(|p| p.unwrap()).collect(), pos))
@@ -343,13 +373,22 @@ pub fn detile_bc1(data: &[u8], place: &Place, tile_mode: u32) -> (Vec<u8>, usize
 
 fn c565(c: u16) -> [u8; 3] {
     let (r, g, b) = ((c >> 11) & 31, (c >> 5) & 63, c & 31);
-    [((r << 3) | (r >> 2)) as u8, ((g << 2) | (g >> 4)) as u8, ((b << 3) | (b >> 2)) as u8]
+    [
+        ((r << 3) | (r >> 2)) as u8,
+        ((g << 2) | (g >> 4)) as u8,
+        ((b << 3) | (b >> 2)) as u8,
+    ]
 }
 
 /// Standard BC1 palette (RGBA): 4-colour when c0 > c1, else 3-colour + transparent black.
 pub fn bc1_palette(c0: u16, c1: u16) -> [[u8; 4]; 4] {
     let (a, b) = (c565(c0), c565(c1));
-    let mut p = [[a[0], a[1], a[2], 255], [b[0], b[1], b[2], 255], [0, 0, 0, 255], [0, 0, 0, 0]];
+    let mut p = [
+        [a[0], a[1], a[2], 255],
+        [b[0], b[1], b[2], 255],
+        [0, 0, 0, 255],
+        [0, 0, 0, 0],
+    ];
     for k in 0..3 {
         let (x, y) = (a[k] as u32, b[k] as u32);
         if c0 > c1 {

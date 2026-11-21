@@ -109,7 +109,10 @@ impl Model {
             k -= 1;
         }
         let base_x = if seg == 0 { 0 } else { 1u32 << (seg - 1) };
-        let dist = (cf.wrapping_sub(self.base[seg] as u32).wrapping_add(self.rn[seg] as u32)) & 0xFFFF;
+        let dist = (cf
+            .wrapping_sub(self.base[seg] as u32)
+            .wrapping_add(self.rn[seg] as u32))
+            & 0xFFFF;
         let add_mul = dist.wrapping_mul(self.rf[seg]);
         let steps = ((add_mul >> 15) >> self.rs[seg]) & 0x1FF;
         ((base_x + steps) & 0x1FF) as u16
@@ -126,7 +129,10 @@ impl Model {
             seg += (cf >= self.thr[k]) as usize;
         }
         let base_x = (1u32 << seg) >> 1;
-        let dist = (cf.wrapping_sub(self.base[seg] as u32).wrapping_add(self.rn[seg] as u32)) & 0xFFFF;
+        let dist = (cf
+            .wrapping_sub(self.base[seg] as u32)
+            .wrapping_add(self.rn[seg] as u32))
+            & 0xFFFF;
         let steps = ((dist.wrapping_mul(self.rf[seg]) >> 15) >> self.rs[seg]) & 0x1FF;
         ((base_x + steps) & 0x1FF) as u16
     }
@@ -157,7 +163,9 @@ impl Model {
     #[inline]
     pub fn advance(&self, x: u32, sym: u16) -> u32 {
         let (f, cf) = self.forward(sym);
-        f.wrapping_mul(x >> 16).wrapping_add(x & 0xFFFF).wrapping_sub(cf)
+        f.wrapping_mul(x >> 16)
+            .wrapping_add(x & 0xFFFF)
+            .wrapping_sub(cf)
     }
 }
 
@@ -198,17 +206,26 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecodeError::BadHeader { lane, eab } => {
-                write!(f, "lane {lane}: fragment header selects alphabet index {eab} (> 8)")
+                write!(
+                    f,
+                    "lane {lane}: fragment header selects alphabet index {eab} (> 8)"
+                )
             }
             DecodeError::NoProgress { consumed } => {
-                write!(f, "no progress after {consumed} bytes (truncated stream or not BCPack BC1)")
+                write!(
+                    f,
+                    "no progress after {consumed} bytes (truncated stream or not BCPack BC1)"
+                )
             }
             DecodeError::CycleLimit => write!(f, "cycle limit reached"),
             DecodeError::IllegalEndState { lanes } => {
                 write!(f, "lanes {lanes:?} ended in an illegal rANS state")
             }
             DecodeError::TrailingData { consumed, len } => {
-                write!(f, "stream ended after {consumed} of {len} bytes but the rest is not zero padding")
+                write!(
+                    f,
+                    "stream ended after {consumed} of {len} bytes but the rest is not zero padding"
+                )
             }
             DecodeError::Invalid(s) => write!(f, "{s}"),
         }
@@ -323,7 +340,9 @@ pub fn decode_lanes<S: ByteSource>(
 ) -> Result<LaneOutput, DecodeError> {
     let n = alphabet_bits.len();
     if n == 0 || n > MAX_LANES {
-        return Err(DecodeError::Invalid(format!("lane count {n} not in 1..={MAX_LANES}")));
+        return Err(DecodeError::Invalid(format!(
+            "lane count {n} not in 1..={MAX_LANES}"
+        )));
     }
     if target == 0 || target > u32::MAX as usize / 2 {
         return Err(DecodeError::Invalid(format!("bad symbol count {target}")));
@@ -390,7 +409,11 @@ pub fn decode_lanes<S: ByteSource>(
                 continue;
             }
             if ln.state == PROC || ln.state == DRAIN {
-                ln.p0 = if ln.sym_full { ln.model.advance(ln.p1, ln.sym) } else { ln.p1 };
+                ln.p0 = if ln.sym_full {
+                    ln.model.advance(ln.p1, ln.sym)
+                } else {
+                    ln.p1
+                };
             }
             if valid {
                 ln.ib = byte;
@@ -432,16 +455,28 @@ pub fn decode_lanes<S: ByteSource>(
         }
         cycle += 1;
         if finished {
-            let bad: Vec<usize> =
-                (0..n).filter(|&i| !is_legal_end_state(lanes[i].final_state)).collect();
+            let bad: Vec<usize> = (0..n)
+                .filter(|&i| !is_legal_end_state(lanes[i].final_state))
+                .collect();
             if !bad.is_empty() {
                 return Err(DecodeError::IllegalEndState { lanes: bad });
             }
             let stats = lanes
                 .iter()
-                .map(|l| LaneStats { bytes: l.nbytes, fragments: l.nfrags, final_state: l.final_state })
+                .map(|l| LaneStats {
+                    bytes: l.nbytes,
+                    fragments: l.nfrags,
+                    final_state: l.final_state,
+                })
                 .collect();
-            return Ok(LaneOutput { lanes: n, target, symbols, consumed: pos, cycles: cycle, stats });
+            return Ok(LaneOutput {
+                lanes: n,
+                target,
+                symbols,
+                consumed: pos,
+                cycles: cycle,
+                stats,
+            });
         }
         let prog = (pos, total_syms, state_sum);
         if prog != last_prog {
@@ -482,7 +517,10 @@ fn phase1(i: usize, ln: &mut Lane) -> Result<(), DecodeError> {
                         ln.eab = if e < 10 { e as u8 } else { 9 };
                         ln.nfrags += 1;
                         if ln.eab > 8 {
-                            return Err(DecodeError::BadHeader { lane: i, eab: ln.eab });
+                            return Err(DecodeError::BadHeader {
+                                lane: i,
+                                eab: ln.eab,
+                            });
                         }
                     }
                 }
@@ -509,7 +547,11 @@ fn phase1(i: usize, ln: &mut Lane) -> Result<(), DecodeError> {
                 st => {
                     // PROC or DRAIN
                     let will = st == PROC && ln.p0 < L && ln.in_rem > 0 && ln.ib_full;
-                    let x = if will { ((ln.p0 & 0xFF_FFFF) << 8) | ln.ib as u32 } else { ln.p0 };
+                    let x = if will {
+                        ((ln.p0 & 0xFF_FFFF) << 8) | ln.ib as u32
+                    } else {
+                        ln.p0
+                    };
                     let nsf = x > L && ln.out_rem > 0;
                     if nsf {
                         ln.out_rem -= 1;
@@ -564,10 +606,16 @@ fn phase1(i: usize, ln: &mut Lane) -> Result<(), DecodeError> {
 /// streams), written with few data-dependent branches: the lanes spend almost
 /// every clock in PROCESSING, so that path is computed with selects and the
 /// rare state changes go through [`phase1`].
-pub fn decode_lanes_fast(data: &[u8], alphabet_bits: &[u8], target: usize) -> Result<LaneOutput, DecodeError> {
+pub fn decode_lanes_fast(
+    data: &[u8],
+    alphabet_bits: &[u8],
+    target: usize,
+) -> Result<LaneOutput, DecodeError> {
     let n = alphabet_bits.len();
     if n == 0 || n > MAX_LANES {
-        return Err(DecodeError::Invalid(format!("lane count {n} not in 1..={MAX_LANES}")));
+        return Err(DecodeError::Invalid(format!(
+            "lane count {n} not in 1..={MAX_LANES}"
+        )));
     }
     if target == 0 || target > u32::MAX as usize / 2 {
         return Err(DecodeError::Invalid(format!("bad symbol count {target}")));
@@ -625,7 +673,8 @@ pub fn decode_lanes_fast(data: &[u8], alphabet_bits: &[u8], target: usize) -> Re
             let bit = 1u32 << i;
             let st = ln.state;
             let blocked_out = ln.sym_full & (slots & bit != 0);
-            let need = !ln.ib_full & (((st >= HDR0) & (st <= HDR2)) | ((st == PROC) & (ln.in_rem > 0)));
+            let need =
+                !ln.ib_full & (((st >= HDR0) & (st <= HDR2)) | ((st == PROC) & (ln.in_rem > 0)));
             let grant = need & !blocked_out & (served < FEED_WINDOW) & (pos < len);
             let stall = (need & !grant) | blocked_out;
             ln.stall = stall;
@@ -659,7 +708,11 @@ pub fn decode_lanes_fast(data: &[u8], alphabet_bits: &[u8], target: usize) -> Re
                 if st >= PROC {
                     let is_proc = st == PROC;
                     let will = is_proc & (ln.p0 < L) & (ln.in_rem > 0) & ln.ib_full;
-                    let x = if will { (ln.p0 << 8) | ln.ib as u32 } else { ln.p0 };
+                    let x = if will {
+                        (ln.p0 << 8) | ln.ib as u32
+                    } else {
+                        ln.p0
+                    };
                     let nsf = (x > L) & (ln.out_rem > 0);
                     ln.sym = ln.model.inverse_fast(x as u16);
                     ln.out_rem -= nsf as u32;
@@ -690,19 +743,33 @@ pub fn decode_lanes_fast(data: &[u8], alphabet_bits: &[u8], target: usize) -> Re
         }
         cycle += 1;
         if finished {
-            let bad: Vec<usize> = (0..n).filter(|&i| !is_legal_end_state(lanes[i].final_state)).collect();
+            let bad: Vec<usize> = (0..n)
+                .filter(|&i| !is_legal_end_state(lanes[i].final_state))
+                .collect();
             if !bad.is_empty() {
                 return Err(DecodeError::IllegalEndState { lanes: bad });
             }
             let mut symbols = vec![0u16; n * target];
             for i in 0..n {
-                symbols[i * target..(i + 1) * target].copy_from_slice(&store[i * stride..i * stride + target]);
+                symbols[i * target..(i + 1) * target]
+                    .copy_from_slice(&store[i * stride..i * stride + target]);
             }
             let stats = lanes
                 .iter()
-                .map(|l| LaneStats { bytes: l.nbytes, fragments: l.nfrags, final_state: l.final_state })
+                .map(|l| LaneStats {
+                    bytes: l.nbytes,
+                    fragments: l.nfrags,
+                    final_state: l.final_state,
+                })
                 .collect();
-            return Ok(LaneOutput { lanes: n, target, symbols, consumed: pos, cycles: cycle, stats });
+            return Ok(LaneOutput {
+                lanes: n,
+                target,
+                symbols,
+                consumed: pos,
+                cycles: cycle,
+                stats,
+            });
         }
         let prog = (pos, total_syms, state_sum);
         if prog != last_prog {
@@ -749,10 +816,17 @@ fn transition(ln: &mut Lane, x: u32, nsf: bool) {
 
 /// Decode lanes from a byte slice and check that everything after the last
 /// consumed byte is zero padding.
-pub fn decode_slice(data: &[u8], alphabet_bits: &[u8], target: usize) -> Result<LaneOutput, DecodeError> {
+pub fn decode_slice(
+    data: &[u8],
+    alphabet_bits: &[u8],
+    target: usize,
+) -> Result<LaneOutput, DecodeError> {
     let out = decode_lanes_fast(data, alphabet_bits, target)?;
     if data[out.consumed..].iter().any(|&b| b != 0) {
-        return Err(DecodeError::TrailingData { consumed: out.consumed, len: data.len() });
+        return Err(DecodeError::TrailingData {
+            consumed: out.consumed,
+            len: data.len(),
+        });
     }
     Ok(out)
 }
@@ -773,7 +847,11 @@ mod tests {
                 for cf in 1..=0xFFFFu32 {
                     let s = m.inverse(cf as u16);
                     assert_eq!(s, m.inverse_exact(cf as u16), "eab {eab} q {q} cf {cf}");
-                    assert_eq!(s, m.inverse_fast(cf as u16), "fast: eab {eab} q {q} cf {cf}");
+                    assert_eq!(
+                        s,
+                        m.inverse_fast(cf as u16),
+                        "fast: eab {eab} q {q} cf {cf}"
+                    );
                     let (f, c) = m.forward(s);
                     assert!(c <= cf && cf < c + f, "eab {eab} q {q} cf {cf} sym {s}");
                 }
