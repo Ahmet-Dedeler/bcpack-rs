@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use or build on this project, please credit it as below."
+type: software
+title: "bcpack-rs"
+abstract: "Clean-room decoder for Xbox Series BCPack (MDU rANS) texture streams: Rust crate and CLI, Python reference decoder, and a written spec."
+authors:
+  - given-names: Ahmet
+    family-names: Dedeler
+    alias: Ahmet-Dedeler
+    website: "https://ahmetdedeler.com"
+repository-code: "https://github.com/Ahmet-Dedeler/bcpack-rs"
+url: "https://github.com/Ahmet-Dedeler/bcpack-rs"
+license:
+  - MIT
+  - Apache-2.0

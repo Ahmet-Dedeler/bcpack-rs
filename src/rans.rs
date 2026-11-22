@@ -1,3 +1,7 @@
+// bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 //! Multi-lane MDU rANS decoder (entropy layer).
 //!
 //! Each lane is a cycle-level port of the `decoder` module in Microsoft's

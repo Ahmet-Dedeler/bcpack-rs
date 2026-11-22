@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+# Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 """Generate the MDU rANS model tables from Microsoft's reference Verilog.
 
 usage: python3 -I tools/gen_tables.py path/to/silicon-rans/mdu_minirans.v
@@ -52,13 +56,20 @@ Index [eab][q][seg]: eab = alphabet bits - 1 (0..8), q = model (0..15),
 seg = 0 for symbol 0, k >= 1 for symbols [2^(k-1), 2^k)."""
 
 
+CREDIT = """bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+SPDX-License-Identifier: MIT OR Apache-2.0
+If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README."""
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     vpath = sys.argv[1]
     t = parse(vpath)
     h = checksum(t)
-    rs = ["// " + l if l else "//" for l in HEADER.split("\n")]
+    rs = ["// " + l for l in CREDIT.split("\n")] + ["//"]
+    rs += ["// " + l if l else "//" for l in HEADER.split("\n")]
     rs.append("")
     rs.append('/// SHA-256 of the canonical table text (see `tools/gen_tables.py`).')
     rs.append('pub const TABLES_SHA256: &str = "%s";' % h)
@@ -76,7 +87,8 @@ def main():
             rs.append("    ],")
         rs.append("];")
     open(os.path.join(ROOT, "src", "tables.rs"), "w").write("\n".join(rs) + "\n")
-    py = ['"""' + HEADER + '\n"""', "", 'TABLES_SHA256 = "%s"' % h, ""]
+    py = ["# " + l for l in CREDIT.split("\n")]
+    py += ['"""' + HEADER + '\n"""', "", 'TABLES_SHA256 = "%s"' % h, ""]
     for n in NAMES:
         py.append("%s = [" % n.upper())
         for e in range(9):

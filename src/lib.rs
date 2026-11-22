@@ -1,3 +1,7 @@
+// bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 //! Decoder for Xbox Series BCPack BC1 texture streams.
 //!
 //! BCPack is the rANS entropy layer the Xbox Series MDU puts over BCn blocks.

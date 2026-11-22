@@ -1,3 +1,7 @@
+// bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+// Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 //! Whole-texture decode from an RDS5 store (feature `ttpf`).
 
 use crate::{bc1, ttpf};
