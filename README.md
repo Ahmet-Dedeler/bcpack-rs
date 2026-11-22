@@ -113,3 +113,13 @@ The retail checks need your own copy of the texture pools; point the harness at 
 - Xbox2Windows (R0Y00) and MarlomMedeiros' corpus-wide BCPack measurements (issue #15): fixed 8-byte rounds, demand-driven refills, the 2/3-byte length flag, lane-dependent constant models.
 - Leonida (Kam471): per-codec chunk counts and size statistics across all pools.
 - paryzius' ttpf-viewer: exact Gfx10 detiling and mip-tail placement, ported in `src/ttpf.rs`.
+
+## Related projects
+
+- [Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars): RPF9/TTPF archive explorer for macOS and Windows
+- [awesome-gta6-reverse-engineering](https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering): every open-source GTA VI reverse engineering project in one list
+- [rage9-re](https://github.com/Ahmet-Dedeler/rage9-re): `script.rpf` and `anim.rpf` decoder with glTF export
+- [bink-player-mac](https://github.com/Ahmet-Dedeler/bink-player-mac): Bink 2 (`.bk2`) video player for macOS
+- [weather-study](https://github.com/Ahmet-Dedeler/weather-study): WebGL2 weather and timecycle visualizer
+
+Questions, previews and format research: [join the Discord](https://discord.gg/reADpA6Cd).
