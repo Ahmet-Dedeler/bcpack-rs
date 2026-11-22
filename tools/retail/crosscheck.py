@@ -1,3 +1,8 @@
+# bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+# Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
+#
 # Retail-data check (not run by the test suites). Needs your own texture pools and the
 # research branches checked out. Configure with environment variables:
 #   BCPACK_GAME_ROOT   texture pool root (read by the harness)

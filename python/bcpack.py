@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+# Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 """Reference decoder for Xbox Series BCPack BC1 chunks (pure Python, stdlib only).
 
 This is the readable mirror of the Rust decoder in ../src. It is slow (about

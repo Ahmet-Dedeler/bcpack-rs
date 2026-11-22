@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler, https://ahmetdedeler.com)
+# Source: https://github.com/Ahmet-Dedeler/bcpack-rs
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 """Refresh the decoder's two fitted data tables from the research outputs.
 
 usage: python3 -I tools/import_tables.py [--window WINDOW.json] [--quad QUAD.json]
