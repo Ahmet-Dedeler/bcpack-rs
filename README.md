@@ -2,6 +2,12 @@
 
 Decoder for **BCPack**, the rANS entropy codec that the Xbox Series X|S Media Decompression Unit (MDU) uses for block-compressed (`BC1`-`BC7`) textures. Rust crate and CLI, a stdlib-only Python reference decoder, and a written spec ([`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md)).
 
+<p align="center">
+  <a href="https://discord.gg/reADpA6Cd"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="36" /></a>
+  <br />
+  <sub>Questions, previews, bug reports and format research. Come say hi.</sub>
+</p>
+
 Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all tests use synthetic streams.
 
 ## Status
