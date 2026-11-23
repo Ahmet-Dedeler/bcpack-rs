@@ -39,20 +39,31 @@ pub fn header_model(alphabet_bits: u8, z: u8) -> Option<u8> {
     }
 }
 
-fn header(z: u8, flush: bool, q: u8, len: usize) -> Vec<u8> {
-    assert!((1..=65535 + 257).contains(&len), "fragment length {len}");
+fn header(z: u8, flush: bool, q: u8, len: usize) -> Result<Vec<u8>, String> {
+    if !(1..=65535 + 257).contains(&len) {
+        return Err(format!("fragment length {len} not in 1..={}", 65535 + 257));
+    }
     let hdr3 = len > 256;
     let b0 = (z & 3) << 6 | (hdr3 as u8) << 5 | (flush as u8) << 4 | (q & 15);
     if hdr3 {
         let v = len - 257;
-        vec![b0, v as u8, (v >> 8) as u8]
+        Ok(vec![b0, v as u8, (v >> 8) as u8])
     } else {
-        vec![b0, (len - 1) as u8]
+        Ok(vec![b0, (len - 1) as u8])
     }
 }
 
 /// Encode one flushed fragment (header + payload).
 pub fn encode_fragment(alphabet_bits: u8, frag: &Fragment) -> Result<Vec<u8>, String> {
+    if alphabet_bits > 8 {
+        return Err(format!("alphabet_bits {alphabet_bits} not in 0..=8"));
+    }
+    if frag.z > 3 {
+        return Err(format!("fragment z {} not in 0..=3", frag.z));
+    }
+    if frag.q >= 16 {
+        return Err(format!("fragment q {} not in 0..=15", frag.q));
+    }
     let eab = header_model(alphabet_bits, frag.z).ok_or("z selects an undefined alphabet")?;
     let m: &Model = rans::model(eab, frag.q);
     if frag.symbols.is_empty() {
@@ -90,7 +101,7 @@ pub fn encode_fragment(alphabet_bits: u8, frag: &Fragment) -> Result<Vec<u8>, St
     }
     let mut payload = (x as u32).to_be_bytes().to_vec();
     payload.extend(rev[ntrim..].iter().rev());
-    let mut out = header(frag.z, true, frag.q, payload.len());
+    let mut out = header(frag.z, true, frag.q, payload.len())?;
     out.extend(payload);
     Ok(out)
 }
@@ -116,6 +127,13 @@ pub fn interleave(
     target: usize,
     lane_bytes: &[Vec<u8>],
 ) -> Result<Vec<u8>, DecodeError> {
+    if lane_bytes.len() != alphabet_bits.len() {
+        return Err(DecodeError::Invalid(format!(
+            "lane_bytes count {} != alphabet_bits count {}",
+            lane_bytes.len(),
+            alphabet_bits.len()
+        )));
+    }
     let total: usize = lane_bytes.iter().map(|v| v.len()).sum();
     let mut src = PerLane {
         queues: lane_bytes
@@ -142,6 +160,16 @@ pub fn interleave(
 
 /// Encode whole lanes (each a list of fragments) into one interleaved stream.
 pub fn encode_lanes(alphabet_bits: &[u8], lanes: &[Vec<Fragment>]) -> Result<Vec<u8>, String> {
+    if lanes.is_empty() {
+        return Err("lanes must not be empty".into());
+    }
+    if lanes.len() != alphabet_bits.len() {
+        return Err(format!(
+            "lanes count {} != alphabet_bits count {}",
+            lanes.len(),
+            alphabet_bits.len()
+        ));
+    }
     let target = lanes[0].iter().map(|f| f.symbols.len()).sum::<usize>();
     let mut bytes = Vec::new();
     for (i, frags) in lanes.iter().enumerate() {
@@ -191,6 +219,7 @@ pub fn sample_symbol(rng: &mut Rng, eab: u8, q: u8) -> u16 {
 /// models), split into fragments of at most `max_frag` symbols. Returns the
 /// stream and the symbols per lane.
 pub fn synthetic_bc1(seed: u64, blocks: usize, max_frag: usize) -> (Vec<u8>, Vec<Vec<u16>>) {
+    assert!(max_frag > 0, "max_frag must be > 0");
     let mut rng = Rng(seed | 1);
     let ab = bc1::BC1_ALPHABET_BITS;
     let mut lanes = Vec::new();

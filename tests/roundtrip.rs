@@ -251,3 +251,53 @@ fn python_vectors() {
         }
     }
 }
+
+#[test]
+fn validation_and_error_guards() {
+    // alphabet_bits > 8 must be rejected cleanly
+    assert!(matches!(
+        rans::decode_lanes_fast(&[0u8; 8], &[16], 1),
+        Err(rans::DecodeError::Invalid(_))
+    ));
+    // encoder rejects invalid z / q instead of producing corrupt headers or panicking
+    let bad_q = encode::Fragment {
+        symbols: vec![0],
+        q: 16,
+        z: 0,
+    };
+    assert!(encode::encode_fragment(7, &bad_q).is_err());
+    let bad_z = encode::Fragment {
+        symbols: vec![0],
+        q: 0,
+        z: 4,
+    };
+    assert!(encode::encode_fragment(7, &bad_z).is_err());
+    assert!(encode::encode_lanes(&[7], &[]).is_err());
+    assert!(encode::interleave(&[7, 7], 1, &[vec![]]).is_err());
+}
+
+#[cfg(feature = "ttpf")]
+#[test]
+fn ttpf_codec_mask_high_file_offset_and_mip_bounds() {
+    // Entry 0 sits at file_off = 0x1_0000_0000 (bit 24 set in `a`) with CODEC_BC1 (0x04).
+    // Bits 24..25 belong to file_off, so codec must stay 0x04, not 0x05.
+    let mut data = vec![0u8; 0x18 + 16];
+    data[..4].copy_from_slice(b"RDS5");
+    data[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let a0: u32 = (1u32 << 24) | ((bcpack::ttpf::CODEC_BC1 as u32) << 24);
+    let a1: u32 = (1u32 << 24) | 1u32;
+    data[0x18..0x1C].copy_from_slice(&a0.to_le_bytes());
+    data[0x1C..0x20].copy_from_slice(&0u32.to_le_bytes());
+    data[0x20..0x24].copy_from_slice(&a1.to_le_bytes());
+    data[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+    let store = bcpack::ttpf::Store::from_bytes(data).unwrap();
+    assert_eq!(store.chunks.len(), 1);
+    assert_eq!(store.chunks[0].file_off, 0x1_0000_0000);
+    assert_eq!(store.chunks[0].codec, bcpack::ttpf::CODEC_BC1);
+    assert!(store.chunk_bytes(99, true).is_err());
+
+    // Invalid mip inputs must return None, not panic on shift overflow
+    assert!(bcpack::ttpf::mip_chain_bc1(0, 0, 64, 1).is_none());
+    assert!(bcpack::ttpf::mip_chain_bc1(0, 64, 0, 1).is_none());
+    assert!(bcpack::ttpf::mip_chain_bc1(0, 64, 64, 33).is_none());
+}

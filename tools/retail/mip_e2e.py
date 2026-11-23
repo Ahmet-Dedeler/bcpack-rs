@@ -25,16 +25,21 @@ SCR = os.path.join(os.environ.get("BCPACK_SCRATCH", tempfile.gettempdir()), "bcp
 def job(tid):
     r = mipscore.pairs()[tid]
     parts = []; unf = 0; pre = 0
-    for cid, _, _ in r["mip0_chunks"]:
+    for idx, (cid, _, _) in enumerate(r["mip0_chunks"]):
         info = ttpf.chunk_info(cid)
-        fn = os.path.join(SCR, cid.replace("/", "_") + ".bin")
+        safe = f"{os.getpid()}_{tid}_{idx}_{cid.replace('/', '_').replace(':', '_')}"
+        fn = os.path.join(SCR, safe + ".bin")
         open(fn, "wb").write(ttpf.extract(cid, strip_pad=False))
         p = subprocess.run([BIN, "decode-bc1", fn, str(info.vlen // 8), fn + ".bc1"], capture_output=True, text=True)
-        os.unlink(fn)
+        if os.path.exists(fn):
+            os.unlink(fn)
         if p.returncode != 0:
+            if os.path.exists(fn + ".bc1"):
+                os.unlink(fn + ".bc1")
             return {"tid": tid, "error": p.stderr.strip()[-200:]}
         m = re.search(r"(\d+) references before block 0, (\d+) blocks depend", p.stderr)
-        pre += int(m.group(1)); unf += int(m.group(2))
+        if m:
+            pre += int(m.group(1)); unf += int(m.group(2))
         parts.append(open(fn + ".bc1", "rb").read()); os.unlink(fn + ".bc1")
     s = mipscore.score(tid, b"".join(parts), "stream")
     return {"tid": tid, "psnr": s["psnr"], "flat": s["psnr_flat"], "unfitted": unf, "prestart": pre,

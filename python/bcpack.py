@@ -84,6 +84,8 @@ class Model:
 
     def forward(self, sym):
         """(freq, cumulative freq) of sym; slot 0 is reserved (cf 0 -> f-1, 1)."""
+        if sym < 0 or sym >= 512:
+            raise ValueError("rANS symbol %d out of range (must be 0..511)" % sym)
         seg = sym.bit_length()
         st = 0 if seg == 0 else 1 << (seg - 1)
         fa = self.freq[seg]
@@ -153,6 +155,16 @@ def decode_lanes(data, alphabet_bits, targets, window=FEED_WINDOW, source=None):
     unless every lane finished with a legal end state.
     """
     n = len(alphabet_bits)
+    if n == 0 or n > 16:
+        raise BCPackError("lane count %d not in 1..=16" % n)
+    if len(targets) != n:
+        raise BCPackError("targets length %d != lane count %d" % (len(targets), n))
+    for i, ab in enumerate(alphabet_bits):
+        if not (0 <= ab <= 8):
+            raise BCPackError("lane %d: alphabet_bits %d not in 0..=8" % (i, ab))
+    for i, t in enumerate(targets):
+        if t <= 0:
+            raise BCPackError("lane %d: bad symbol count %d" % (i, t))
     lanes = [Lane(i, alphabet_bits[i], targets[i]) for i in range(n)]
     slots = [False] * n
     pos = 0
@@ -169,18 +181,25 @@ def decode_lanes(data, alphabet_bits, targets, window=FEED_WINDOW, source=None):
             blocked_out = ln.sym_full and not sym_ready
             need = ln.need_byte()
             req = need and not blocked_out
-            valid = req and served < window and pos < end
+            valid = False
+            byte = 0
+            if req and served < window and pos < end:
+                if source is None:
+                    byte = data[pos]
+                    valid = True
+                else:
+                    b = source(ln.idx)
+                    if b is not None:
+                        byte = b
+                        valid = True
+                        order.append(ln.idx)
             ln.stall = (need and not valid) or blocked_out
             if ln.stall:
                 continue
             if ln.state in (PROC, DRAIN):
                 ln.p0 = ln.forward_state(ln.p1, ln.sym) if ln.sym_full else ln.p1
             if valid:
-                if source is None:
-                    ln.ib = data[pos]
-                else:
-                    ln.ib = source(ln.idx)
-                    order.append(ln.idx)
+                ln.ib = byte
                 pos += 1
                 served += 1
                 ln.nbytes += 1

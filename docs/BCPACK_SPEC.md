@@ -25,7 +25,7 @@ A texture pool is an `RDS5` store. A chunk is a range of the store's virtual (un
 Entry i describes chunk i, which runs to entry i + 1 in both address spaces:
 
 - file offset `(a & 0x3FFFFFF) << 8`
-- codec `(a >> 24) & 0x3F`: `0x00` stored, `0x20` zlib, `0x04` BC1 BCPack (`0x0C` BC3, `0x10` BC4, `0x14` BC5, `0x18` BC6H, `0x1C` BC7)
+- codec `(a >> 24) & 0x3C`: `0x00` stored, `0x20` zlib, `0x04` BC1 BCPack (`0x0C` BC3, `0x10` BC4, `0x14` BC5, `0x18` BC6H, `0x1C` BC7)
 - virtual offset `((a >> 30) | (b & 0xFFFFF) << 2) << 12`
 - `b >> 20`: zero bytes of padding at the end of the stored chunk
 

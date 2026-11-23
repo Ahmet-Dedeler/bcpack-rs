@@ -43,10 +43,21 @@ pub fn texture_mip0(
     let (levels, _) = ttpf::mip_chain_bc1(tex.tile_mode, tex.width, tex.height, tex.mips)
         .ok_or_else(|| err("unsupported mip layout".into()))?;
     let p0 = &levels[0];
-    let a = tex.vstart + p0.off;
-    let mut gfx10 = Vec::with_capacity(p0.len as usize);
+    let a = tex
+        .vstart
+        .checked_add(p0.off)
+        .ok_or_else(|| err("virtual start overflow".into()))?;
+    let end = a
+        .checked_add(p0.len)
+        .ok_or_else(|| err("virtual end overflow".into()))?;
+    let spans = store.locate(a, end)?;
+    let cap = usize::try_from(p0.len).map_err(|_| err("mip 0 size overflow".into()))?;
+    let mut gfx10 = Vec::new();
+    gfx10
+        .try_reserve_exact(cap)
+        .map_err(|_| err("mip 0 allocation failed".into()))?;
     let (mut nbc, mut unfitted) = (0, 0);
-    for (ci, f, e) in store.locate(a, a + p0.len)? {
+    for (ci, f, e) in spans {
         let c = &store.chunks[ci];
         let bytes = match c.codec {
             ttpf::CODEC_BC1 => {

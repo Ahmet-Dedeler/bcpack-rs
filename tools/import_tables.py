@@ -24,7 +24,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def arg(name, default):
-    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+    if name not in sys.argv:
+        return default
+    idx = sys.argv.index(name)
+    if idx + 1 >= len(sys.argv):
+        sys.exit(f"missing value for {name}")
+    return sys.argv[idx + 1]
 
 
 def dump(doc, path, list_key):
@@ -45,28 +50,53 @@ def dump(doc, path, list_key):
         f.write("\n".join(lines) + "\n")
 
 
+def _validate_endpoint_value(slot, val):
+    limits = (31, 63, 31, 31, 63, 31)
+    if not isinstance(val, (list, tuple)) or len(val) != 6:
+        raise ValueError(f"window slot {slot}: expected 6 endpoint fields")
+    out = [int(x) for x in val]
+    for i, (x, hi) in enumerate(zip(out, limits)):
+        if not (0 <= x <= hi):
+            raise ValueError(f"window slot {slot} field {i}: {x} not in 0..={hi}")
+    return out
+
+
 def import_window(path):
     d = json.load(open(path))
     if "slots" in d and isinstance(d["slots"], list):   # already in our format
-        slots = d["slots"]
+        if len(d["slots"]) != 256:
+            raise ValueError(f"window slots must have 256 entries, got {len(d['slots'])}")
+        slots = []
+        for idx, entry in enumerate(d["slots"]):
+            if entry is None:
+                slots.append(None)
+            elif isinstance(entry, dict) and "value" in entry:
+                e2 = dict(entry)
+                e2["value"] = _validate_endpoint_value(idx, entry["value"])
+                slots.append(e2)
+            else:
+                raise ValueError(f"window slot {idx}: bad entry {entry!r}")
         meta = {k: v for k, v in d.items() if k != "slots"}
     else:
         src = d["slots"] if isinstance(d.get("slots"), dict) else d
         slots = [None] * 256
         meta = {}
         for k, v in src.items():
-            if not k.isdigit():
+            if not (isinstance(k, str) and k.isascii() and k.isdigit()):
+                continue
+            idx = int(k)
+            if not (0 <= idx < 256) or not isinstance(v, dict):
                 continue
             val = v.get("value") or v.get("joint")
             if val is None:
                 continue
-            ent = {"value": [int(x) for x in val]}
+            ent = {"value": _validate_endpoint_value(idx, val)}
             for key in ("textures", "near", "blocks", "rms", "halves_agree"):
                 if key in v and isinstance(v[key], (int, float, bool)):
                     ent[key] = v[key]
             if "per" in v and "textures" not in ent:
                 ent["textures"] = len(v["per"])
-            slots[int(k)] = ent
+            slots[idx] = ent
     out = {
         "format": "BCPack BC1 preset endpoint window: slot s = endpoint fields "
                   "[R0, G0, B0, R1, G1, B1] read by a back reference that points before block 0 "
@@ -85,6 +115,11 @@ def import_quad(path):
     d = json.load(open(path))
     ents = sorted(d["entries"], key=lambda e: e["sym"])
     assert [e["sym"] for e in ents] == list(range(256))
+    for e in ents:
+        codes = e["codes"]
+        assert len(codes) == 4 and all(isinstance(c, int) and 0 <= c <= 3 for c in codes), (
+            f"bad quad codes for sym {e['sym']}: {codes}"
+        )
     pats = set(tuple(e["codes"]) for e in ents)
     assert len(pats) == 256, "not a bijection"
     out = {

@@ -11,7 +11,7 @@
 //! * header: `RDS5`, u32 entry count n, u32 virtual size low, u32 (bits 0-7 =
 //!   virtual size high), u32 ETPF offset / 256; chunk table of n u64 entries at 0x18;
 //! * entry i = (u32 a, u32 b): chunk i starts at file offset `(a & 0x3FFFFFF) << 8`,
-//!   codec `(a >> 24) & 0x3F`, virtual offset `((a >> 30) | (b & 0xFFFFF) << 2) << 12`,
+//!   codec `(a >> 24) & 0x3C`, virtual offset `((a >> 30) | (b & 0xFFFFF) << 2) << 12`,
 //!   `b >> 20` trailing zero pad bytes; it runs to entry i + 1 in both spaces;
 //! * codecs: 0x00 stored, 0x20 zlib, 0x04 BC1 BCPack (0x08..0x1C other BCn BCPack);
 //! * ETPF index: `ETPF`, count at +8, then 16-byte descriptors and 8-byte hashes.
@@ -87,7 +87,11 @@ impl Store {
         let n = u32le(&data, 4) as usize;
         let vsize = u32le(&data, 8) as u64 | ((u32le(&data, 12) as u64 & 0xFF) << 32);
         let etpf_off = (u32le(&data, 16) as u64) << 8;
-        if 0x18 + 8 * n > data.len() {
+        let tbl_end = n
+            .checked_mul(8)
+            .and_then(|bytes| 0x18usize.checked_add(bytes))
+            .ok_or_else(|| bad("chunk table size overflow"))?;
+        if tbl_end > data.len() {
             return Err(bad("chunk table past end of file"));
         }
         let ent = |i: usize| (u32le(&data, 0x18 + 8 * i), u32le(&data, 0x1C + 8 * i));
@@ -106,7 +110,7 @@ impl Store {
                 pad: (b >> 20) as u64,
                 vstart: v,
                 vlen: v2.saturating_sub(v),
-                codec: ((a >> 24) & 0x3F) as u8,
+                codec: ((a >> 24) & 0x3C) as u8,
             });
         }
         Ok(Store {
@@ -119,9 +123,19 @@ impl Store {
 
     /// Stored bytes of a chunk (with the trailing pad when `with_pad`).
     pub fn chunk_bytes(&self, i: usize, with_pad: bool) -> io::Result<&[u8]> {
-        let c = &self.chunks[i];
+        let c = self
+            .chunks
+            .get(i)
+            .ok_or_else(|| bad(format!("chunk index {i} out of range")))?;
         let len = if with_pad { c.file_len } else { c.data_len() };
-        let (a, b) = (c.file_off as usize, (c.file_off + len) as usize);
+        let a = usize::try_from(c.file_off)
+            .map_err(|_| bad(format!("chunk {i} offset overflow")))?;
+        let end_u64 = c
+            .file_off
+            .checked_add(len)
+            .ok_or_else(|| bad(format!("chunk {i} end overflow")))?;
+        let b = usize::try_from(end_u64)
+            .map_err(|_| bad(format!("chunk {i} end overflow")))?;
         self.data
             .get(a..b)
             .ok_or_else(|| bad(format!("chunk {i} past end of file")))
@@ -129,25 +143,32 @@ impl Store {
 
     /// Unpacked bytes of a plain (stored or zlib) chunk.
     pub fn plain_chunk(&self, i: usize) -> io::Result<Vec<u8>> {
-        let c = &self.chunks[i];
+        let c = self
+            .chunks
+            .get(i)
+            .ok_or_else(|| bad(format!("chunk index {i} out of range")))?;
+        let vlen = usize::try_from(c.vlen)
+            .map_err(|_| bad(format!("chunk {i}: vlen {} overflow", c.vlen)))?;
         let raw = self.chunk_bytes(i, true)?;
         let mut out = match c.codec {
             CODEC_ZLIB => {
-                let mut v = Vec::with_capacity(c.vlen as usize);
-                flate2::read::ZlibDecoder::new(raw).read_to_end(&mut v)?;
+                let mut v = Vec::new();
+                flate2::read::ZlibDecoder::new(raw)
+                    .take(c.vlen)
+                    .read_to_end(&mut v)?;
                 v
             }
             CODEC_STORED => raw.to_vec(),
             x => return Err(bad(format!("chunk {i}: codec {x:#x} is not plain"))),
         };
-        if (out.len() as u64) < c.vlen {
+        if out.len() < vlen {
             return Err(bad(format!(
                 "chunk {i}: {} bytes < vlen {}",
                 out.len(),
                 c.vlen
             )));
         }
-        out.truncate(c.vlen as usize);
+        out.truncate(vlen);
         Ok(out)
     }
 
@@ -172,15 +193,23 @@ impl Store {
     }
 
     pub fn textures(&self) -> io::Result<Vec<Texture>> {
-        let at = self.etpf_off as usize;
+        let at = usize::try_from(self.etpf_off).map_err(|_| bad("ETPF offset overflow"))?;
         let d = &self.data;
-        if at + 16 > d.len() || &d[at..at + 4] != b"ETPF" {
+        let hdr_end = at.checked_add(16).ok_or_else(|| bad("no ETPF index"))?;
+        if hdr_end > d.len() || &d[at..at + 4] != b"ETPF" {
             return Err(bad("no ETPF index"));
         }
         let t = u32le(d, at + 8) as usize;
-        let desc = at + 16;
-        let hashes = desc + 16 * t;
-        if hashes + 8 * t > d.len() {
+        let desc = hdr_end;
+        let hashes = t
+            .checked_mul(16)
+            .and_then(|bytes| desc.checked_add(bytes))
+            .ok_or_else(|| bad("ETPF index size overflow"))?;
+        let end = t
+            .checked_mul(8)
+            .and_then(|bytes| hashes.checked_add(bytes))
+            .ok_or_else(|| bad("ETPF index size overflow"))?;
+        if end > d.len() {
             return Err(bad("ETPF index past end of file"));
         }
         Ok((0..t)
@@ -282,7 +311,7 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
     let elem: u64 = 8;
     let pat = pattern_8b(tile_mode);
     let is64k = tile_mode == 0;
-    if mips == 0 {
+    if w == 0 || h == 0 || mips == 0 || mips > 32 {
         return None;
     }
     let (_, _, bw, bh) = tile_lut(pat);
@@ -334,19 +363,21 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
     for i in (0..tail).rev() {
         let (ew, eh) = el(i);
         let (nx, ny) = (ew.div_ceil(bw), eh.div_ceil(bh));
-        let ln = nx as u64 * ny as u64 * tile_bytes;
+        let pw = nx.checked_mul(tw)?;
+        let ph = ny.checked_mul(th)?;
+        let ln = (nx as u64).checked_mul(ny as u64)?.checked_mul(tile_bytes)?;
         let (lw, lh) = px(i);
         levels[i as usize] = Some(Place {
             w: lw,
             h: lh,
             off: pos,
             len: ln,
-            pw: nx * tw,
-            ph: ny * th,
+            pw,
+            ph,
             ox: 0,
             oy: 0,
         });
-        pos += ln;
+        pos = pos.checked_add(ln)?;
     }
     Some((levels.into_iter().map(|p| p.unwrap()).collect(), pos))
 }

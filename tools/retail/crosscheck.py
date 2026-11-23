@@ -30,13 +30,21 @@ os.makedirs(SCR, exist_ok=True)
 QT = json.load(open(os.path.join(os.environ["BCPACK_SEM_INDICES"], "quad_table.json")))["entries"]
 CODES = {e["sym"]: e["codes"] for e in QT}
 def _load_hist(path):
-    """Window JSON as written by the endpoint fit: {"slots": {slot: {"value": [...]}}} or {slot: {...}}."""
+    """Window JSON as written by the endpoint fit: {"slots": [...] or {slot: {"value": [...]}}}."""
     d = json.load(open(path))
-    src = d["slots"] if isinstance(d.get("slots"), dict) else d
     W = [(0, 0, 0, 0, 0, 0)] * 256
+    if isinstance(d.get("slots"), list):
+        for i, v in enumerate(d["slots"][:256]):
+            if isinstance(v, dict) and v.get("value") is not None:
+                W[i] = tuple(v["value"])
+        return W
+    src = d["slots"] if isinstance(d.get("slots"), dict) else d
     for k, v in src.items():
-        if k.isdigit():
-            W[int(k)] = tuple(v.get("value") or v["joint"])
+        if isinstance(k, str) and k.isascii() and k.isdigit() and isinstance(v, dict):
+            idx = int(k)
+            val = v.get("value") or v.get("joint")
+            if 0 <= idx < 256 and val is not None:
+                W[idx] = tuple(val)
     return W
 HIST = _load_hist(os.environ["BCPACK_WINDOW"])
 
@@ -89,11 +97,16 @@ if __name__ == "__main__":
             byst.setdefault(d["store"], []).append(d["id"])
     rng = random.Random(seed)
     stores = sorted(byst)
+    target_n = min(n, sum(len(v) for v in byst.values()))
     ids = []
-    while len(ids) < n:
+    while len(ids) < target_n:
+        progressed = False
         for s in stores:
-            if len(ids) < n and byst[s]:
+            if len(ids) < target_n and byst[s]:
                 ids.append(byst[s].pop(rng.randrange(len(byst[s]))))
+                progressed = True
+        if not progressed:
+            break
     with Pool(int(os.environ.get("JOBS", "6"))) as p:
         res = p.map(job, ids, chunksize=1)
     same = sum(r[4] for r in res); both_fail = sum((not r[2]) and (not r[3]) for r in res)

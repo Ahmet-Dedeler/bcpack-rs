@@ -238,7 +238,15 @@ fn cmd_scan(o: &Opts) {
     }
     let t0 = Instant::now();
     let mut total = Tally::default();
+    let mut stem_counts: BTreeMap<String, usize> = BTreeMap::new();
     for path in &o.pos {
+        let s = Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        *stem_counts.entry(s).or_default() += 1;
+    }
+    for (store_idx, path) in o.pos.iter().enumerate() {
         let store = match ttpf::Store::open(Path::new(path)) {
             Ok(s) => s,
             Err(e) => {
@@ -255,10 +263,15 @@ fn cmd_scan(o: &Opts) {
             .map(|c| c.index)
             .step_by(o.every)
             .collect();
-        let stem = Path::new(path)
+        let raw_stem = Path::new(path)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
+        let stem = if stem_counts.get(&raw_stem).copied().unwrap_or(0) > 1 {
+            format!("{raw_stem}_{store_idx}")
+        } else {
+            raw_stem
+        };
         let tallies: Vec<Tally> = ids
             .par_iter()
             .map(|&ci| {
@@ -288,7 +301,10 @@ fn cmd_scan(o: &Opts) {
                         t.clean = (out.unfitted_blocks == 0) as usize;
                         if let Some(d) = &o.emit {
                             let p = d.join(format!("{stem}_{ci}.bc1"));
-                            std::fs::write(p, &out.blocks).ok();
+                            if let Err(e) = std::fs::write(&p, &out.blocks) {
+                                eprintln!("{}: {e}", p.display());
+                                *t.errors.entry(format!("emit: {e}")).or_default() += 1;
+                            }
                         }
                     }
                     Err(e) => {
@@ -345,26 +361,33 @@ fn cmd_scan(o: &Opts) {
     }
 }
 
-#[repr(C)]
-struct Timespec {
-    sec: i64,
-    nsec: i64,
-}
-
-extern "C" {
-    fn clock_gettime(clk: i32, tp: *mut Timespec) -> i32;
-}
-
-/// CPU time of the calling thread in seconds (the machine may be shared, so
-/// wall time understates the decoder's speed).
-fn thread_cpu_secs() -> f64 {
+/// CPU time of the calling thread in seconds when supported by the OS (the
+/// machine may be shared, so wall time can understate the decoder's speed).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn thread_cpu_secs() -> Option<f64> {
+    #[repr(C)]
+    struct Timespec {
+        sec: std::ffi::c_long,
+        nsec: std::ffi::c_long,
+    }
+    extern "C" {
+        fn clock_gettime(clk: std::ffi::c_int, tp: *mut Timespec) -> std::ffi::c_int;
+    }
     #[cfg(target_os = "macos")]
-    const CLOCK_THREAD_CPUTIME_ID: i32 = 16;
-    #[cfg(not(target_os = "macos"))]
-    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    const CLOCK_THREAD_CPUTIME_ID: std::ffi::c_int = 16;
+    #[cfg(target_os = "linux")]
+    const CLOCK_THREAD_CPUTIME_ID: std::ffi::c_int = 3;
     let mut t = Timespec { sec: 0, nsec: 0 };
-    unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut t) };
-    t.sec as f64 + t.nsec as f64 * 1e-9
+    if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
+        Some(t.sec as f64 + t.nsec as f64 * 1e-9)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn thread_cpu_secs() -> Option<f64> {
+    None
 }
 
 fn cmd_bench(o: &Opts) {
@@ -375,14 +398,25 @@ fn cmd_bench(o: &Opts) {
     let blocks: usize = o.pos[1]
         .parse()
         .unwrap_or_else(|_| die("blocks must be a number"));
-    let secs: f64 = o.pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+    let secs: f64 = match o.pos.get(2) {
+        Some(raw) => {
+            let v: f64 = raw
+                .parse()
+                .unwrap_or_else(|_| die("seconds must be a positive number"));
+            if !v.is_finite() || v <= 0.0 {
+                die("seconds must be a positive number");
+            }
+            v
+        }
+        None => 2.0,
+    };
     let _ = bc1::decode(&data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     let t0 = Instant::now();
     let c0 = thread_cpu_secs();
     let mut n = 0u64;
     let mut consumed = 0usize;
     let mut cycles = 0u64;
-    while t0.elapsed().as_secs_f64() < secs {
+    while n == 0 || t0.elapsed().as_secs_f64() < secs {
         let lanes = bc1::decode_symbols(&data, blocks).unwrap();
         consumed = lanes.consumed;
         cycles = lanes.cycles;
@@ -391,7 +425,8 @@ fn cmd_bench(o: &Opts) {
         n += 1;
     }
     let wall = t0.elapsed().as_secs_f64();
-    let s = thread_cpu_secs() - c0;
+    let cpu = c0.and_then(|start| thread_cpu_secs().map(|end| end - start));
+    let s = cpu.filter(|&d| d > 0.0).unwrap_or(wall).max(1e-9);
     println!(
         "{n} decodes, {s:.2} s CPU ({wall:.2} s wall): {:.1} MB/s compressed in, {:.1} MB/s BC1 out, \
          {:.2} Mblocks/s per core; {:.2} clocks per block",

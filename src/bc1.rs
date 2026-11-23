@@ -123,9 +123,13 @@ impl QuadTable {
         let mut codes = [[0u8; 4]; 256];
         let mut seen = [false; 256];
         for e in arr {
-            let s = e["sym"].as_u64().ok_or("quad table: bad sym")? as usize;
+            let s_u64 = e["sym"].as_u64().ok_or("quad table: bad sym")?;
             let c = e["codes"].as_array().ok_or("quad table: bad codes")?;
-            if s > 255 || c.len() != 4 || seen[s] {
+            if s_u64 > 255 || c.len() != 4 {
+                return Err(format!("quad table: bad entry for symbol {s_u64}"));
+            }
+            let s = s_u64 as usize;
+            if seen[s] {
                 return Err(format!("quad table: bad entry for symbol {s}"));
             }
             for k in 0..4 {

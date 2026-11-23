@@ -129,8 +129,8 @@ impl Model {
     pub fn inverse_fast(&self, cf: u16) -> u16 {
         let cf = cf as u32;
         let mut seg = 0usize;
-        for k in 1..10 {
-            seg += (cf >= self.thr[k]) as usize;
+        for &t in &self.thr[1..] {
+            seg += (cf >= t) as usize;
         }
         let base_x = (1u32 << seg) >> 1;
         let dist = (cf
@@ -151,6 +151,7 @@ impl Model {
     /// cumulative frequency would be 0 gets `(f - 1, 1)`.
     #[inline]
     pub fn forward(&self, sym: u16) -> (u32, u32) {
+        assert!(sym < 512, "rANS symbol {sym} out of range (must be < 512)");
         let s = sym as u32;
         let seg = (32 - s.leading_zeros()) as usize;
         let st = if seg == 0 { 0 } else { 1u32 << (seg - 1) };
@@ -177,6 +178,7 @@ static MODELS: OnceLock<Vec<Model>> = OnceLock::new();
 
 /// The 9 x 16 models, built once.
 pub fn model(eab: u8, q: u8) -> &'static Model {
+    assert!(eab < 9 && q < 16, "rANS model out of range: eab={eab}, q={q}");
     let all = MODELS.get_or_init(|| {
         let mut v = Vec::with_capacity(144);
         for e in 0..9 {
@@ -348,9 +350,23 @@ pub fn decode_lanes<S: ByteSource>(
             "lane count {n} not in 1..={MAX_LANES}"
         )));
     }
+    if let Some((i, &ab)) = alphabet_bits.iter().enumerate().find(|(_, &ab)| ab > 8) {
+        return Err(DecodeError::Invalid(format!(
+            "lane {i}: alphabet_bits {ab} not in 0..=8"
+        )));
+    }
     if target == 0 || target > u32::MAX as usize / 2 {
         return Err(DecodeError::Invalid(format!("bad symbol count {target}")));
     }
+    let total_cap = n
+        .checked_mul(target)
+        .filter(|&c| c.checked_mul(std::mem::size_of::<u16>()).is_some_and(|b| b <= isize::MAX as usize))
+        .ok_or_else(|| DecodeError::Invalid(format!("symbol buffer size overflow ({n} x {target})")))?;
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(total_cap)
+        .map_err(|_| DecodeError::Invalid(format!("cannot allocate {total_cap} symbols")))?;
+    symbols.resize(total_cap, 0u16);
     let m0 = model(0, 0);
     let mut lanes: Vec<Lane> = alphabet_bits
         .iter()
@@ -380,12 +396,13 @@ pub fn decode_lanes<S: ByteSource>(
             final_state: 0,
         })
         .collect();
-    let mut symbols = vec![0u16; n * target];
     let mut slots: u32 = 0;
     let mut pos: usize = 0;
-    let mut exhausted = false;
+    let mut exhausted_mask: u32 = 0;
     let mut cycle: u64 = 0;
-    let max_cycles: u64 = 64 * (n as u64 * target as u64 + stream_len as u64) + 1000;
+    let max_cycles: u64 = 64u64
+        .saturating_mul((n as u64).saturating_mul(target as u64).saturating_add(stream_len as u64))
+        .saturating_add(1000);
     let mut total_syms: u64 = 0;
     let mut last_prog = (usize::MAX, u64::MAX, u32::MAX);
     let mut last_change: u64 = 0;
@@ -399,13 +416,13 @@ pub fn decode_lanes<S: ByteSource>(
             let need = ln.need_byte();
             let mut valid = false;
             let mut byte = 0u8;
-            if need && !blocked_out && served < FEED_WINDOW && !exhausted {
+            if need && !blocked_out && served < FEED_WINDOW && (exhausted_mask & bit) == 0 {
                 match src.next(i) {
                     Some(b) => {
                         valid = true;
                         byte = b;
                     }
-                    None => exhausted = true,
+                    None => exhausted_mask |= bit,
                 }
             }
             ln.stall = (need && !valid) || blocked_out;
@@ -621,14 +638,31 @@ pub fn decode_lanes_fast(
             "lane count {n} not in 1..={MAX_LANES}"
         )));
     }
+    if let Some((i, &ab)) = alphabet_bits.iter().enumerate().find(|(_, &ab)| ab > 8) {
+        return Err(DecodeError::Invalid(format!(
+            "lane {i}: alphabet_bits {ab} not in 0..=8"
+        )));
+    }
     if target == 0 || target > u32::MAX as usize / 2 {
         return Err(DecodeError::Invalid(format!("bad symbol count {target}")));
     }
     if data.is_empty() {
         return Err(DecodeError::NoProgress { consumed: 0 });
     }
+    // One spare slot per lane: the symbol store below writes unconditionally.
+    let stride = target
+        .checked_add(1)
+        .ok_or_else(|| DecodeError::Invalid(format!("bad symbol count {target}")))?;
+    let store_cap = n
+        .checked_mul(stride)
+        .filter(|&c| c.checked_mul(std::mem::size_of::<u16>()).is_some_and(|b| b <= isize::MAX as usize))
+        .ok_or_else(|| DecodeError::Invalid(format!("symbol buffer size overflow ({n} x {stride})")))?;
+    let mut store = Vec::new();
+    store
+        .try_reserve_exact(store_cap)
+        .map_err(|_| DecodeError::Invalid(format!("cannot allocate {store_cap} symbols")))?;
+    store.resize(store_cap, 0u16);
     let m0 = model(0, 0);
-    let lut0: &'static [u16] = m0.lut();
     let mut lanes: Vec<Lane> = alphabet_bits
         .iter()
         .map(|&ab| Lane {
@@ -657,15 +691,13 @@ pub fn decode_lanes_fast(
             final_state: 0,
         })
         .collect();
-    let mut luts: Vec<&'static [u16]> = vec![lut0; n];
-    // One spare slot per lane: the symbol store below writes unconditionally.
-    let stride = target + 1;
-    let mut store = vec![0u16; n * stride];
     let len = data.len();
     let mut slots: u32 = 0;
     let mut pos: usize = 0;
     let mut cycle: u64 = 0;
-    let max_cycles: u64 = 64 * (n as u64 * target as u64 + len as u64) + 1000;
+    let max_cycles: u64 = 64u64
+        .saturating_mul((n as u64).saturating_mul(target as u64).saturating_add(len as u64))
+        .saturating_add(1000);
     let mut total_syms: u64 = 0;
     let mut last_prog = (usize::MAX, u64::MAX, u32::MAX);
     let mut last_change: u64 = 0;
@@ -678,7 +710,7 @@ pub fn decode_lanes_fast(
             let st = ln.state;
             let blocked_out = ln.sym_full & (slots & bit != 0);
             let need =
-                !ln.ib_full & (((st >= HDR0) & (st <= HDR2)) | ((st == PROC) & (ln.in_rem > 0)));
+                !ln.ib_full & ((HDR0..=HDR2).contains(&st) | ((st == PROC) & (ln.in_rem > 0)));
             let grant = need & !blocked_out & (served < FEED_WINDOW) & (pos < len);
             let stall = (need & !grant) | blocked_out;
             ln.stall = stall;
@@ -730,9 +762,6 @@ pub fn decode_lanes_fast(
                     }
                 } else {
                     phase1(i, ln)?;
-                    if ln.state == PROC || ln.state == HDR2 {
-                        luts[i] = ln.model.lut();
-                    }
                 }
             }
             let bit = 1u32 << i;
