@@ -18,6 +18,8 @@
 //! Modules:
 //! * [`rans`]: the 12-lane cycle-level rANS decoder (entropy layer);
 //! * [`bc1`]: lane symbols -> BC1 endpoints and index words;
+//! * [`format`], [`bcn`], [`bc7`]: work in progress, the block rebuild of BC3, BC4,
+//!   BC5 and BC7 (rules exact, tables incomplete; see `docs/findings/bc345-bc7.md`);
 //! * [`ttpf`]: RDS5 texture stores, Gfx10 detiling, DDS/PNG output;
 //! * [`encode`]: a synthetic encoder used by the tests;
 //! * [`tables`]: the exact model tables, generated from Microsoft's
@@ -26,7 +28,10 @@
 //! See `docs/BCPACK_SPEC.md` for the format and the evidence behind it.
 
 pub mod bc1;
+pub mod bc7;
+pub mod bcn;
 pub mod encode;
+pub mod format;
 pub mod rans;
 pub mod tables;
 #[cfg(feature = "ttpf")]
