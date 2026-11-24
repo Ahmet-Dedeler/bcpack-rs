@@ -3,7 +3,7 @@
 Decoder for **BCPack**, the rANS entropy codec that the Xbox Series X|S Media Decompression Unit (MDU) uses for block-compressed (`BC1`-`BC7`) textures. Rust crate and CLI, a stdlib-only Python reference decoder, and a written spec ([`docs/BCPACK_SPEC.md`](docs/BCPACK_SPEC.md)).
 
 <p align="center">
-  <a href="https://discord.gg/reADpA6Cd"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="36" /></a>
+  <a href="https://discord.gg/CjcDBg3nf"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="36" /></a>
   <br />
   <sub>Questions, previews, bug reports and format research. Come say hi.</sub>
 </p>
@@ -128,4 +128,4 @@ The retail checks need your own copy of the texture pools; point the harness at 
 - [bink-player-mac](https://github.com/Ahmet-Dedeler/bink-player-mac): Bink 2 (`.bk2`) video player for macOS
 - [weather-study](https://github.com/Ahmet-Dedeler/weather-study): WebGL2 weather and timecycle visualizer
 
-Questions, previews and format research: [join the Discord](https://discord.gg/reADpA6Cd).
+Questions, previews and format research: [join the Discord](https://discord.gg/CjcDBg3nf).
