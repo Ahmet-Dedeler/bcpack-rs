@@ -121,7 +121,7 @@ Status: **verified**. On textures without references before block 0, the decoded
 
 When d > i the reference points before the chunk. It reads slot `(i - d) mod 256` of a **fixed 256-entry table of endpoint fields**, the same for every chunk. The table is not in the stream. The decoder loads it from `data/bc1_window.json`, where each slot is `[R0, G0, B0, R1, G1, B1]` or `null` (not fitted yet; decoded as zeros, and the decoder reports how many blocks depend on such slots).
 
-Status: **fitted**. The values were fitted against mip consistency; 254 of 256 slots are known (slots 0 and 4 were never referenced). Slot 242's single value fits 100/100 textures that use it, and fits on two halves of the data agree. With the full table, 600/600 random pair textures decode at a 35.4 dB median against the plain mip 1. The entries look like a trained codebook of common endpoint pairs and follow no formula of the slot index.
+Status: **complete (fitted, then corrected against a reference)**. The values were first fitted against mip consistency, which gave 254 slots. Compared with the format's constant BC1 dictionary as a reference decoder carries it (255 entries standing for blocks -1 to -255, so slot 0 does not exist), 180 fitted slots were equal, 74 were off by an L1 distance of 1 to 8, and slot 4 had never been referenced. Those 75 now hold the reference value; on the 600-texture mip check the median moved from 35.39 to 35.52 dB and the textures below 25 dB from 3 to 0. The notes below describe the original fit. Slot 242's single value fits 100/100 textures that use it, and fits on two halves of the data agree. With the full table, 600/600 random pair textures decode at a 35.4 dB median against the plain mip 1. The entries look like a trained codebook of common endpoint pairs and follow no formula of the slot index.
 
 ### 5.4 Lanes 8-11: index quadrants
 
@@ -147,7 +147,7 @@ Status: **verified** (Gfx10 order beats row-major in 3,243/3,244 textures on a q
 
 ## 6. What is not known
 
-- Window slots 0 and 4 (section 5.3; never referenced in the fitting data) and the 4 uncertain codebook pairs (5.4).
+- The 4 uncertain codebook pairs (5.4). The index codebook has not been compared with a reference yet.
 - 3-colour blocks (c0 <= c1) fit mip 1 worse than 4-colour blocks; no separate table was found.
 - Other codecs. BC7 uses 16 lanes (widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`) under the same entropy layer; its block semantics are open. BC3/4/5/6H are not started.
 

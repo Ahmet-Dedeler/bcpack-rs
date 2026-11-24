@@ -12,13 +12,13 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1 decodes.** `bcpack decode-bc1` turns a BCPack BC1 chunk into plain BC1 blocks. The entropy layer is exact. The block layer uses two small constant tables fitted from data (a 256-slot preset endpoint window and a 256-entry index codebook); both are now essentially complete.
+**BC1 decodes.** `bcpack decode-bc1` turns a BCPack BC1 chunk into plain BC1 blocks. The entropy layer is exact. The block layer uses two small constant tables (a 255-entry preset endpoint window and a 256-entry index codebook). The window is complete; the codebook is fitted from data and essentially complete.
 
 | Part | Status |
 |---|---|
 | Entropy layer (rANS) | **Exact.** Microsoft's MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT), a clock-for-clock port of its lane decoder, bytes fed in lane order (8 per clock) with all 12 lanes in lockstep. Every lane must consume exactly its byte budget and end in a legal state, so a wrong rule fails loudly |
 | BC1 endpoints | **Verified.** Lane 0 is a back-reference "copy block *i − d*", lanes 2-7 add zigzag corrections to R0 G0 B0 R1 G1 B1. References before the chunk start read a fixed 256-entry preset window |
-| BC1 preset window | **Fitted.** 254 of 256 slots (`data/bc1_window.json`); slots 0 and 4 were never referenced in the fitting data. The decoder reports any block that depends on an unfitted slot |
+| BC1 preset window | **Complete.** All 255 slots (`data/bc1_window.json`). 180 fitted slots already equalled the format's constant BC1 dictionary as a reference decoder carries it; the 74 that were off by a few levels, and slot 4, now hold that value. Slot 0 does not exist in the format |
 | BC1 indices | **Fitted.** Each 2x2 quadrant is a symbol into a fixed, frequency-ordered table of all 256 index patterns (`data/bc1_quad_table.json`). Two independent fits agree on 248/256 entries (99.76% of quadrants); 8 rare mirror pairs are uncertain |
 | BC1 block order | Standard Gfx10 tiled order (stream order = stored order) |
 | BC7 | Entropy layer solved (research branches): 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`. 4,600+ chunks converge exactly, 0 of 1,180 controls do. Block mapping (modes, partitions) in progress. Not in this decoder yet |
@@ -32,7 +32,7 @@ All measured on retail Xbox Series texture pools with the commands in [Reproduci
 |---|---|
 | Exact convergence (`bcpack scan --every 20`, every 20th BC1 chunk of all 57 pools) | **5,162/5,162** chunks (97.9 M blocks): all 12 lanes end in a legal state with exactly `blocks` symbols, and the bytes consumed equal the stored length minus the pad in 5,162/5,162. 5,161 touch no unfitted preset-window slot |
 | Rust vs the Python research pipeline (probe simulator + endpoint rule + codebook), byte for byte | **520/520** chunks identical, sampled round-robin across 52 stores (1,024-16,384 blocks), plus **12/12** chunks of 32,768-65,536 blocks |
-| Mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode, none touching an unfitted window slot. Median **35.4 dB**, p10 30.2, p90 41.8 (flat mean-colour baseline 22.6); 3 below 25 dB, 18 not at least 3 dB above flat. With only the first 16 window slots the same set scored median 27.6, p10 7.3 |
+| Mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode, none touching an unfitted window slot. Median **35.5 dB**, p10 30.7, p90 42.0 (flat mean-colour baseline 22.6); 0 below 25 dB, 16 not at least 3 dB above flat. With the purely fitted window the same set scored median 35.4, p10 30.2, 3 below 25 dB. With only the first 16 window slots the same set scored median 27.6, p10 7.3 |
 | Held-out check of the fitted tables (fit on half the texture pools, decode the other half) | Preset window fitted on even pools, scored on odd: 1,514 textures, median **34.7 dB**, p10 29.7. Reverse: 1,481 textures, median **34.0 dB**, p10 28.7. In-sample on all: 34.4 dB. The two half-fits agree within ±1 on 228/249 slots (99.9% of blocks by use). Index codebook fitted on half the pools: 36.6 / 36.1 dB held out, 248/256 entries identical between halves. 200 random textures larger than 512 px: 200/200 decode, median 37.4 dB. Plain BC1 ceiling on the same test: 37.9 dB |
 | Speed | **34-40 MB/s of BC1 output per core** (4.3-5 M blocks/s, 25 MB/s compressed input), CPU time, `bcpack bench` on 4,096- and 65,536-block chunks. Chunks decode independently, so `scan` scales across cores (8 threads on a heavily shared machine: about 110 MB/s). Below the 50 MB/s per-core target |
 
