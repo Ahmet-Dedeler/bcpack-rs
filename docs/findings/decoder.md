@@ -68,6 +68,6 @@ requests bytes.
 
 ## What is left
 
-1. Preset window slots 0 and 4 (never referenced so far). To refresh the table: `python3 -I tools/import_tables.py --window <fit.json>` and rebuild; the golden tests use their own tables.
+1. Preset window: done (2026-11-24, issue #4). 74 fitted slots and slot 4 were replaced with the format's constant dictionary values; slot 0 does not exist. `tools/retail/mip_e2e.py 600 1`: median 35.39 -> 35.52 dB, p10 30.17 -> 30.72, below 25 dB 3 -> 0, not above flat + 3 dB 18 -> 16; per texture 44 better, 27 worse (largest loss 0.30 dB, largest gain 12.31 dB), 529 unchanged. `tools/import_tables.py --window` would overwrite these with fitted values, so don't rerun it for the window.
 2. The 4 uncertain codebook mirror pairs; 3-colour blocks fit worse than 4-colour ones.
 3. Speed (above). Other BCn formats.

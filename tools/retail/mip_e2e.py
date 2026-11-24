@@ -27,7 +27,7 @@ def job(tid):
     parts = []; unf = 0; pre = 0
     for idx, (cid, _, _) in enumerate(r["mip0_chunks"]):
         info = ttpf.chunk_info(cid)
-        safe = f"{os.getpid()}_{tid}_{idx}_{cid.replace('/', '_').replace(':', '_')}"
+        safe = f"{os.getpid()}_{tid}_{idx}_{cid}".replace('/', '_').replace(':', '_')
         fn = os.path.join(SCR, safe + ".bin")
         open(fn, "wb").write(ttpf.extract(cid, strip_pad=False))
         p = subprocess.run([BIN, "decode-bc1", fn, str(info.vlen // 8), fn + ".bc1"], capture_output=True, text=True)
