@@ -153,14 +153,104 @@ fn shipped_tables_load() {
             assert!(t.pairs.known[s]);
             assert!(seen.insert(t.pairs.pairs[s]));
         }
+        if mode == Mode::Bc3 {
+            let mut seen_q = std::collections::HashSet::new();
+            for s in 0..256 {
+                assert!(t.quads.known[s]);
+                assert!(seen_q.insert(t.quads.quads[s]));
+            }
+        }
         assert_eq!(t.dictionary.len(), 255);
+        for (k, &(_, unk)) in t.dictionary.iter().enumerate() {
+            assert_eq!(
+                unk,
+                bcn::Unknown::default(),
+                "{} dictionary entry {k} has unknown fields",
+                mode.name()
+            );
+        }
     }
     let t = bc7::Tables::default_table();
     let known: Vec<Control> = t.control.iter().flatten().copied().collect();
     let distinct: std::collections::HashSet<Control> = known.iter().copied().collect();
     assert_eq!(known.len(), distinct.len());
-    assert!(known.len() >= 205);
+    assert_eq!(known.len(), 285);
     for c in &known {
         assert!(Control::all().contains(c));
     }
+    assert_eq!(t.dictionary.len(), 255);
+    for (k, (st, kn)) in t.dictionary.iter().enumerate() {
+        assert_eq!(st.subsets, 1, "bc7 dictionary entry {k} subsets");
+        assert!(kn.subsets, "bc7 dictionary entry {k} kn.subsets");
+        assert_eq!(kn.ep, [[8; 8]; 3], "bc7 dictionary entry {k} kn.ep");
+        assert_eq!(kn.ix, [[4; 16]; 2], "bc7 dictionary entry {k} kn.ix");
+    }
+}
+
+#[test]
+fn bc7_dictionary_multiset_not_unfitted() {
+    let t = bc7::Tables::default_table();
+    let c7 = Control {
+        mode: 7,
+        partition: 0,
+        rotation: 0,
+        index_selection: 0,
+    };
+    let c0 = Control {
+        mode: 0,
+        partition: 0,
+        rotation: 0,
+        index_selection: 0,
+    };
+    let code7 = t.code_of(c7).expect("mode 7 control code");
+    let code0 = t.code_of(c0).expect("mode 0 control code");
+
+    let n = 3;
+    let mut l = lanes(16, 2 * n);
+    let set = |l: &mut LaneOutput, lane: usize, i: usize, half: usize, v: u16| {
+        l.symbols[lane * 2 * n + 2 * i + half] = v;
+    };
+    let set_ctl = |l: &mut LaneOutput, i: usize, code: usize| {
+        l.symbols[15 * 2 * n + 2 * i] = (code & 31) as u16;
+        l.symbols[15 * 2 * n + 2 * i + 1] = ((code >> 5) & 15) as u16;
+    };
+    let set_refs = |l: &mut LaneOutput, i: usize, ep_ref: usize, ix_ref: usize| {
+        let (d, x) = format::reference_codes(ep_ref, ix_ref);
+        let (de, do_) = format::deinterleave(d);
+        let (xe, xo) = format::deinterleave(x);
+        l.symbols[2 * i] = de;
+        l.symbols[2 * i + 1] = do_;
+        l.symbols[2 * n + 2 * i] = xe;
+        l.symbols[2 * n + 2 * i + 1] = xo;
+    };
+
+    // block 0: 2-subset mode 7, both references hit dictionary entry 4
+    set_ctl(&mut l, 0, code7);
+    set_refs(&mut l, 0, 5, 5);
+    // block 1: 3-subset mode 0, endpoint ref hits dictionary entry 10, index ref hits block 0
+    set_ctl(&mut l, 1, code0);
+    set_refs(&mut l, 1, 12, 1);
+    // block 2: 2-subset mode 7, both references hit block 1 (checks no transitive unfitted bit)
+    set_ctl(&mut l, 2, code7);
+    set_refs(&mut l, 2, 1, 1);
+    set(&mut l, 2, 2, 0, format::zigzag(1));
+
+    let out = bc7::assemble(&l, t);
+    assert_eq!(out.unknown_controls, 0);
+    assert_eq!(out.dictionary_refs, 3);
+    assert_eq!(out.unfitted_blocks, 0);
+    for i in 0..n {
+        let blk = &out.blocks[i * 16..(i + 1) * 16];
+        let (c, st) = bc7::unpack(blk).expect("valid bc7 block");
+        let mut repacked = [0u8; 16];
+        bc7::pack(c, &st, &mut repacked);
+        assert_eq!(&repacked[..], blk);
+    }
+
+    // Partial custom table with unknown subsets still flags multi-subset blocks as unfitted.
+    let mut partial = t.clone();
+    partial.dictionary[4].0.subsets = 0;
+    partial.dictionary[4].1.subsets = false;
+    let out_partial = bc7::assemble(&l, &partial);
+    assert_eq!(out_partial.unfitted_blocks, 1);
 }

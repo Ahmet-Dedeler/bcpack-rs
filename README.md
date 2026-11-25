@@ -12,35 +12,34 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1 decodes.** `bcpack decode-bc1` turns a BCPack BC1 chunk into plain BC1 blocks. The entropy layer is exact. The block layer uses two small constant tables (a 255-entry preset endpoint window and a 256-entry index codebook). The window is complete; the codebook is fitted from data and essentially complete.
+**BC1, BC3, BC4, BC5 and BC7 decode in the Rust library.** The `bcpack` CLI, whole-texture `ttpf-export` (Gfx10 detiling + DDS/PNG), synthetic stream encoder, and Python reference currently handle **BC1** only. **BC6H** has its entropy layer solved (16 lanes in `src/format.rs`), with block rebuild not implemented yet.
 
 | Part | Status |
 |---|---|
-| Entropy layer (rANS) | **Exact.** Microsoft's MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT), a clock-for-clock port of its lane decoder, bytes fed in lane order (8 per clock) with all 12 lanes in lockstep. Every lane must consume exactly its byte budget and end in a legal state, so a wrong rule fails loudly |
-| BC1 endpoints | **Verified.** Lane 0 is a back-reference "copy block *i − d*", lanes 2-7 add zigzag corrections to R0 G0 B0 R1 G1 B1. References before the chunk start read a fixed 256-entry preset window |
-| BC1 preset window | **Complete.** All 255 slots (`data/bc1_window.json`). 180 fitted slots already equalled the format's constant BC1 dictionary as a reference decoder carries it; the 74 that were off by a few levels, and slot 4, now hold that value. Slot 0 does not exist in the format |
-| BC1 indices | **Fitted.** Each 2x2 quadrant is a symbol into a fixed, frequency-ordered table of all 256 index patterns (`data/bc1_quad_table.json`). Two independent fits agree on 248/256 entries (99.76% of quadrants); 8 rare mirror pairs are uncertain |
-| BC1 block order | Standard Gfx10 tiled order (stream order = stored order) |
-| BC7 | Entropy layer solved (research branches): 16 lanes, widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`. 4,600+ chunks converge exactly, 0 of 1,180 controls do. Block mapping (modes, partitions) in progress. Not in this decoder yet |
-| BC6H, BC5, BC4, BC3 | Entropy layer solved (research branches): every chunk in the corpus converges exactly. Block mappings in progress. Not in this decoder yet |
+| Entropy layer (rANS) | **Exact.** Microsoft's MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT), a clock-for-clock port of its lane decoder, bytes fed in lane order (8 per clock) with all lanes (12 or 16) in lockstep. Every lane must consume exactly its byte budget and end in a legal state, so a wrong rule fails loudly |
+| BC1 (`bcpack::bc1`, CLI, Python) | **Decodes.** Endpoints verified (back-reference distance + zigzag residuals), complete 255-entry preset window (`data/bc1_window.json`), fitted 256-entry quadrant index codebook (`data/bc1_quad_table.json`; two independent fits agree on 248/256 entries, 99.76% of quadrants, 8 rare mirror pairs uncertain). Stream order = standard Gfx10 tiled order |
+| BC3, BC4, BC5 (`bcpack::bcn`) | **Decodes (library).** Exact block rebuild rules and complete constant tables (`data/bc3.json`, `bc4.json`, `bc5.json`: 64-entry alpha pair ranks, BC3 256-entry colour quadrant ranks, 255-entry dictionaries). Byte-identical to a reference decoder on all 35 BC3 (660,992 blocks), 77 BC4 (201,728 blocks) and 333 BC5 (4,890,368 blocks) chunks across 57 stores, and independently validated on 100 BC5 + 1 BC3 chunks in issue #5. Not wired into the CLI, `ttpf-export` or Python yet |
+| BC7 (`bcpack::bc7`) | **Decodes (library).** 16 lanes (widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`), two symbols per lane per 16-byte block, exact block rebuild, all 285 control codes and the 255-entry single-subset dictionary (`data/bc7.json`). Byte-identical to a reference decoder on all 5,167 BC7 chunks (80,055,040 blocks) across 57 stores, and independently validated on 28 chunks in issue #5. Not wired into the CLI, `ttpf-export` or Python yet |
+| BC6H (`bcpack::format::Mode::Bc6h`) | **Entropy layer only.** 16 lanes (widths `4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5`); every chunk in the corpus converges at the rANS layer. Block rebuild not implemented yet |
 
 ### Verified numbers (this decoder)
 
-All measured on retail Xbox Series texture pools with the commands in [Reproducing](#reproducing). No game data is in this repository.
+All measured on retail Xbox Series texture pools with the commands in [Reproducing](#reproducing) (plus `docs/findings/bc345-bc7.md`). No game data is in this repository.
 
 | Check | Result |
 |---|---|
-| Exact convergence (`bcpack scan --every 20`, every 20th BC1 chunk of all 57 pools) | **5,162/5,162** chunks (97.9 M blocks): all 12 lanes end in a legal state with exactly `blocks` symbols, and the bytes consumed equal the stored length minus the pad in 5,162/5,162. 5,161 touch no unfitted preset-window slot |
-| Rust vs the Python research pipeline (probe simulator + endpoint rule + codebook), byte for byte | **520/520** chunks identical, sampled round-robin across 52 stores (1,024-16,384 blocks), plus **12/12** chunks of 32,768-65,536 blocks |
-| Mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode, none touching an unfitted window slot. Median **35.5 dB**, p10 30.7, p90 42.0 (flat mean-colour baseline 22.6); 0 below 25 dB, 16 not at least 3 dB above flat. With the purely fitted window the same set scored median 35.4, p10 30.2, 3 below 25 dB. With only the first 16 window slots the same set scored median 27.6, p10 7.3 |
-| Held-out check of the fitted tables (fit on half the texture pools, decode the other half) | Preset window fitted on even pools, scored on odd: 1,514 textures, median **34.7 dB**, p10 29.7. Reverse: 1,481 textures, median **34.0 dB**, p10 28.7. In-sample on all: 34.4 dB. The two half-fits agree within ±1 on 228/249 slots (99.9% of blocks by use). Index codebook fitted on half the pools: 36.6 / 36.1 dB held out, 248/256 entries identical between halves. 200 random textures larger than 512 px: 200/200 decode, median 37.4 dB. Plain BC1 ceiling on the same test: 37.9 dB |
-| Speed | **34-40 MB/s of BC1 output per core** (4.3-5 M blocks/s, 25 MB/s compressed input), CPU time, `bcpack bench` on 4,096- and 65,536-block chunks. Chunks decode independently, so `scan` scales across cores (8 threads on a heavily shared machine: about 110 MB/s). Below the 50 MB/s per-core target |
+| BC3 / BC4 / BC5 / BC7 chunk decode vs reference decoder (all 57 stores, `data/bc{3,4,5,7}.json`) | **0 differing blocks** across **5,612 chunks / 85.8 M blocks**: BC3 35 chunks (660,992 blocks), BC4 77 (201,728), BC5 333 (4,890,368), BC7 5,167 (80,055,040). Independent check on issue #5 (129 chunks: 1 BC3, 100 BC5, 28 BC7; 651,264 blocks): 129/129 decode cleanly, 0 unknown BC7 controls, mip MAE matching plain baselines |
+| BC1 exact convergence (`bcpack scan --every 20`, every 20th BC1 chunk of all 57 pools) | **5,162/5,162** chunks (97.9 M blocks): all 12 lanes end in a legal state with exactly `blocks` symbols, and the bytes consumed equal the stored length minus the pad in 5,162/5,162. 5,161 touch no unfitted preset-window slot |
+| BC1 Rust vs the Python research pipeline (probe simulator + endpoint rule + codebook), byte for byte | **520/520** chunks identical, sampled round-robin across 52 stores (1,024-16,384 blocks), plus **12/12** chunks of 32,768-65,536 blocks |
+| BC1 mip consistency, 600 random pair textures (BCPack mip 0 decoded, downsampled 2x, compared with the plain mip 1) | 600/600 decode, none touching an unfitted window slot. Median **35.5 dB**, p10 30.7, p90 42.0 (flat mean-colour baseline 22.6); 0 below 25 dB, 16 not at least 3 dB above flat. With the purely fitted window the same set scored median 35.4, p10 30.2, 3 below 25 dB. With only the first 16 window slots the same set scored median 27.6, p10 7.3 |
+| BC1 held-out check of the fitted tables (fit on half the texture pools, decode the other half) | Preset window fitted on even pools, scored on odd: 1,514 textures, median **34.7 dB**, p10 29.7. Reverse: 1,481 textures, median **34.0 dB**, p10 28.7. In-sample on all: 34.4 dB. The two half-fits agree within ±1 on 228/249 slots (99.9% of blocks by use). Index codebook fitted on half the pools: 36.6 / 36.1 dB held out, 248/256 entries identical between halves. 200 random textures larger than 512 px: 200/200 decode, median 37.4 dB. Plain BC1 ceiling on the same test: 37.9 dB |
+| BC1 speed | **34-40 MB/s of BC1 output per core** (4.3-5 M blocks/s, 25 MB/s compressed input), CPU time, `bcpack bench` on 4,096- and 65,536-block chunks. Chunks decode independently, so `scan` scales across cores (8 threads on a heavily shared machine: about 110 MB/s). Below the 50 MB/s per-core target |
 
 The plain-BC1 ceiling of the mip-consistency check is about 37.9 dB median. The 5 chunks the research simulator reported as non-converging decode here (see `docs/findings/decoder.md`).
 
 ### Research branches
 
-The work happened in parallel branches. Each has a findings doc in `docs/findings/`. This branch (`decoder`) consolidates them.
+The work happened in parallel branches. Each has a findings doc in `docs/findings/`. `master` consolidates the BC1 decoder and the `bc5-bc7` block rebuild work (`docs/findings/bc345-bc7.md`).
 
 | Branch | What it holds |
 |---|---|
@@ -51,11 +50,14 @@ The work happened in parallel branches. Each has a findings doc in `docs/finding
 | `sem-indices` | The 256-entry quadrant index codebook and its held-out checks |
 | `sem-endpoints` | Endpoint rule, preset-window fitter, full BC1 decode + scoring |
 | `other-formats` | BC7 entropy layer |
-| `decoder` | This code: the consolidated Rust decoder, Python reference, spec |
+| `bc5-bc7` | BC3, BC4, BC5 and BC7 block rebuild and constant tables (merged into `master`) |
+| `decoder` | Consolidated Rust BC1 decoder, Python reference, spec (merged into `master`) |
 
 None of the branches contain game files or decoded textures. Scripts read textures from your own copy at run time.
 
 ## Usage
+
+CLI (BC1):
 
 ```bash
 cargo build --release
@@ -66,14 +68,23 @@ bcpack scan --jobs 8 --every 10 pools/*.ttpf    # convergence and speed over sto
 bcpack bench chunk.bin 4096                     # single-core speed (CPU time)
 ```
 
-`--window file.json` and `--quads file.json` replace the built-in tables, so a newer fit can be tried without rebuilding. `tools/import_tables.py` converts fit outputs into the `data/` format.
+`--window file.json` and `--quads file.json` replace the built-in BC1 tables, so a newer fit can be tried without rebuilding. `tools/import_tables.py` converts fit outputs into the `data/` format.
 
-Library:
+Library (BC1, BC3, BC4, BC5 and BC7):
 
 ```rust
+// BC1 (8 bytes per block)
 let window = bcpack::bc1::Window::default_table();
 let quads = bcpack::bc1::QuadTable::default_table();
-let out = bcpack::bc1::decode(&chunk, blocks, &window, &quads)?;   // out.blocks: blocks * 8 bytes
+let bc1_out = bcpack::bc1::decode(&chunk, blocks, &window, &quads)?; // blocks * 8 bytes
+
+// BC3 / BC4 / BC5 (`unpacked_len` is the chunk's virtual byte length)
+let bc5_tables = bcpack::bcn::Tables::default_for(bcpack::format::Mode::Bc5).unwrap();
+let bc5_out = bcpack::bcn::decode(&chunk, unpacked_len, bc5_tables)?;
+
+// BC7 (`unpacked_len` is the chunk's virtual byte length)
+let bc7_tables = bcpack::bc7::Tables::default_table();
+let bc7_out = bcpack::bc7::decode(&chunk, unpacked_len, bc7_tables)?;
 ```
 
 To embed only the decoder, turn off the default features. The library then depends on `serde_json` alone:
@@ -82,19 +93,22 @@ To embed only the decoder, turn off the default features. The library then depen
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", default-features = false }
 ```
 
-Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`). `cli` (default) adds the `bcpack` tool on top (`rayon`).
+Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`, BC1 only). `cli` (default) adds the `bcpack` tool on top (`rayon`).
 
-Python reference (slow, readable): `python3 -I python/bcpack.py decode-bc1 chunk.bin 4096 out.bc1`.
+Python reference (BC1, slow, readable): `python3 -I python/bcpack.py decode-bc1 chunk.bin 4096 out.bc1`.
 
 ## Layout
 
-- `src/rans.rs`: the 12-lane clocked rANS decoder (a reference version generic over the byte source, and a fast slice version; tests check they agree)
+- `src/rans.rs`: the clocked MDU rANS decoder (12 or 16 lanes; a reference version generic over the byte source, and a fast slice version; tests check they agree)
+- `src/format.rs`: mode metadata (BC1/BC3/BC4/BC5/BC6H/BC7), lane widths, back-reference and dictionary addressing
 - `src/bc1.rs`: lane symbols to BC1 blocks (back references, preset window, quadrant codebook)
+- `src/bcn.rs`: lane symbols to BC3, BC4 and BC5 blocks (pair ranks, BC3 quadrant ranks, 255-entry dictionaries)
+- `src/bc7.rs`: lane symbols to BC7 blocks (control codes, 255-entry dictionary, BC7 block pack/unpack)
 - `src/ttpf.rs`: RDS5 stores, ETPF texture index, Gfx10 mip layout and detiling, BC1 to RGBA, DDS/PNG
-- `src/encode.rs`: synthetic encoder for tests (reverse rANS per fragment, interleaved by replaying the feeder)
+- `src/encode.rs`: synthetic BC1 encoder for tests (reverse rANS per fragment, interleaved by replaying the feeder)
 - `src/tables.rs`, `python/bcpack_tables.py`: generated from `mdu_minirans.v` by `tools/gen_tables.py`
-- `data/`: the fitted preset window and index codebook
-- `python/bcpack.py`: reference decoder, pure Python
+- `data/`: built-in constant tables (`bc1_window.json`, `bc1_quad_table.json`, `bc3.json`, `bc4.json`, `bc5.json`, `bc7.json`)
+- `python/bcpack.py`: BC1 reference decoder, pure Python
 
 ## Tests
 

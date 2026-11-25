@@ -37,8 +37,8 @@
 //! (every mode but 4 and 5 clears the second set). Anchor indices are written
 //! without their top bit.
 //!
-//! The control codes and the dictionary are constants of the format; the ones
-//! in `data/bc7.json` were solved from retail data (see `docs/BCPACK_SPEC.md`).
+//! The control codes and the dictionary are constants of the format; the full
+//! tables ship in `data/bc7.json` (see `docs/findings/bc345-bc7.md`).
 
 use crate::format::{self, Mode, Source, DICTIONARY};
 use crate::rans::{self, DecodeError, LaneOutput};
@@ -425,9 +425,9 @@ pub fn pack(c: Control, st: &State, out: &mut [u8]) {
     let bits = c.index_bits();
     let mut set = |s: usize| {
         let b = bits[s] as u32;
-        for p in 0..16 {
+        for (p, &ix) in st.ix[s].iter().enumerate() {
             let n = b - (anchors >> p & 1) as u32;
-            w.put((st.ix[s][p] >> (4 - b)) as u32, n);
+            w.put((ix >> (4 - b)) as u32, n);
         }
     };
     match mode {
@@ -511,9 +511,9 @@ pub fn unpack(block: &[u8]) -> Option<(Control, State)> {
     let bits = c.index_bits();
     let mut set = |st: &mut State, s: usize| {
         let b = bits[s] as u32;
-        for p in 0..16 {
+        for (p, ix) in st.ix[s].iter_mut().enumerate() {
             let n = b - (anchors >> p & 1) as u32;
-            st.ix[s][p] = (take(n) << (4 - b)) as u8;
+            *ix = (take(n) << (4 - b)) as u8;
         }
     };
     match mode {
@@ -555,8 +555,7 @@ pub fn apply(
     // A dictionary entry whose subset count is unknown: every row it might lend is unknown.
     let common = subsets.min(er.subsets as usize);
     let subsets_unknown = er_known.map(|k| !k.subsets).unwrap_or(false);
-    for ch in 0..4 {
-        let p = prec[ch];
+    for (ch, &p) in prec.iter().enumerate() {
         if p == 0 {
             continue;
         }

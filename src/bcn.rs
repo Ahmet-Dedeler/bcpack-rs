@@ -32,8 +32,9 @@
 //! | BC3 | E/O interleaved | lane 2 = alpha e0, e1; lanes 7, 8, 9 = R, G, B of colour 0 (E) and 1 (O) | lanes 3-6 alpha pairs as BC5; lane 10 = quadrants TL (E), TR (O), lane 11 = BL, BR |
 //!
 //! The rank tables and dictionaries are constants of the format. They are not
-//! in the stream; the ones in `data/` were solved from retail data and carry
-//! a per-value "known" flag (see `docs/BCPACK_SPEC.md`).
+//! in the stream; the full tables ship in `data/bc{3,4,5}.json` and each value
+//! still carries a "known" flag for partial custom tables (see
+//! `docs/findings/bc345-bc7.md`).
 
 use crate::format::{self, Mode, Source, DICTIONARY};
 use crate::rans::{self, DecodeError, LaneOutput};
