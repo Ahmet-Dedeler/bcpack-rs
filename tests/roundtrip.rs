@@ -51,8 +51,8 @@ fn test_tables() -> (Window, QuadTable) {
     }
     let mut codes = [[0u8; 4]; 256];
     for (s, c) in codes.iter_mut().enumerate() {
-        for k in 0..4 {
-            c[k] = ((s >> (2 * k)) & 3) as u8;
+        for (k, code) in c.iter_mut().enumerate() {
+            *code = ((s >> (2 * k)) & 3) as u8;
         }
     }
     (w, QuadTable::from_codes(codes))
@@ -67,8 +67,8 @@ fn synthetic_round_trip_many() {
         let out =
             bc1::decode_symbols(&stream, blocks).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         assert_eq!(out.consumed, stream.len());
-        for l in 0..12 {
-            assert_eq!(out.lane(l), &syms[l][..], "seed {seed} lane {l}");
+        for (l, expected) in syms.iter().enumerate() {
+            assert_eq!(out.lane(l), expected, "seed {seed} lane {l}");
         }
         // The reference (generic) clocked model must agree with the fast one.
         let mut src = SliceSource {
@@ -79,6 +79,125 @@ fn synthetic_round_trip_many() {
         assert_eq!(r.symbols, out.symbols);
         assert_eq!(r.cycles, out.cycles);
     }
+}
+
+/// Compare both clocked decoders, including the fields that do not affect the
+/// reconstructed texture. Return the oracle's result for fixture assertions.
+fn compare_decoders(data: &[u8], bits: &[u8], target: usize) -> Result<(), DecodeError> {
+    let mut src = SliceSource { data, pos: 0 };
+    let reference = rans::decode_lanes(&mut src, bits, target, data.len());
+    let fast = rans::decode_lanes_fast(data, bits, target);
+    assert_eq!(
+        fast,
+        reference,
+        "{} lanes, {target} symbols, {} bytes",
+        bits.len(),
+        data.len()
+    );
+    reference.map(|_| ())
+}
+
+fn split_fragments(rng: &mut encode::Rng, ab: u8, blocks: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut left = blocks;
+    while left > 0 {
+        let count = left.min(1 + rng.below(1024) as usize);
+        let q = rng.below(16) as u8;
+        let z = rng.below(4).min(ab as u64) as u8;
+        let symbols = (0..count)
+            .map(|_| encode::sample_symbol(rng, ab - z, q))
+            .collect();
+        let frag = encode::encode_fragment(ab, &Fragment { symbols, q, z }).unwrap();
+        let flags = frag[0] & !0x30;
+        let payload = &frag[if frag[0] & 0x20 != 0 { 3 } else { 2 }..];
+        // Split an encoded payload without flushing its state. This also
+        // exercises DRAIN with a partially loaded initial state.
+        let cut = 1 + rng.below((payload.len() - 1).min(256) as u64) as usize;
+        // Up to three starting bytes cannot emit a symbol. The next header
+        // can select a different model while retaining this partial state.
+        let first_flags = if cut <= 3 { flags ^ 0x0f } else { flags };
+        bytes.extend([first_flags, (cut - 1) as u8]);
+        bytes.extend_from_slice(&payload[..cut]);
+        let tail = payload.len() - cut;
+        if tail > 256 {
+            bytes.push(flags | 0x30);
+            bytes.extend_from_slice(&((tail - 257) as u16).to_le_bytes());
+        } else {
+            bytes.extend([flags | 0x10, (tail - 1) as u8]);
+        }
+        bytes.extend_from_slice(&payload[cut..]);
+        left -= count;
+    }
+    bytes
+}
+
+#[test]
+fn clocked_decoders_agree_across_fragment_boundaries() {
+    let wide = [4, 4, 8, 8, 8, 8, 8, 7, 7, 5, 6, 8, 8, 8, 8, 5];
+    let mut rng = encode::Rng(0xe7c10c);
+    for n in 1..=16 {
+        let varied: Vec<_> = (0..n).map(|_| rng.below(9) as u8).collect();
+        let bits = match n {
+            12 => &BC1_ALPHABET_BITS[..],
+            16 => &wide[..],
+            _ => &varied,
+        };
+        for blocks in [1, 19, 256, 1024] {
+            let lanes: Vec<_> = bits
+                .iter()
+                .map(|&ab| split_fragments(&mut rng, ab, blocks))
+                .collect();
+            let data = encode::interleave(bits, blocks, &lanes).unwrap();
+            compare_decoders(&data, bits, blocks).unwrap();
+            for len in [0, 1, data.len() / 2, data.len() - 1] {
+                compare_decoders(&data[..len], bits, blocks).unwrap_err();
+            }
+            for _ in 0..8 {
+                let mut damaged = data.clone();
+                let pos = rng.below(data.len() as u64) as usize;
+                damaged[pos] ^= 1 << rng.below(8);
+                let _ = compare_decoders(&damaged, bits, blocks);
+            }
+        }
+    }
+}
+
+#[test]
+fn clocked_decoders_agree_on_invalid_inputs() {
+    for (bits, target) in [
+        (&[][..], 1),
+        (&[0; 17][..], 1),
+        (&[9][..], 1),
+        (&[0][..], 0),
+        (&[0][..], usize::MAX),
+    ] {
+        assert!(matches!(
+            compare_decoders(&[], bits, target),
+            Err(DecodeError::Invalid(_))
+        ));
+    }
+    assert_eq!(
+        compare_decoders(&[0xc0], &[0], 1),
+        Err(DecodeError::BadHeader { lane: 0, eab: 9 })
+    );
+    assert_eq!(
+        compare_decoders(&[0x10, 0, 1], &[0], 1),
+        Err(DecodeError::NoProgress { consumed: 3 })
+    );
+    assert_eq!(
+        compare_decoders(&[0x10, 3, 0xff, 0xff, 0xff, 0xff], &[0], 1),
+        Err(DecodeError::IllegalEndState { lanes: vec![0] })
+    );
+    // Steady-state PROC lane stalled at x == L with a prefetched byte and
+    // >= 8 bytes remaining: must trigger NoProgress inside the PROC burst.
+    assert_eq!(
+        compare_decoders(
+            &[0x10, 0x0c, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0],
+            4
+        ),
+        Err(DecodeError::NoProgress { consumed: 7 })
+    );
 }
 
 #[test]
@@ -198,13 +317,13 @@ fn prediction_chains_cross_history_wraps() {
         stats: vec![],
     };
     let out = bc1::assemble(&lanes, &w, &q);
-    for (i, block) in out.blocks.chunks_exact(8).enumerate() {
+    for (i, block) in out.blocks.chunks(8).enumerate() {
         // Each chain starts in slots 1..=255 and gains one every 255 blocks.
         let slot = i % 255 + 1;
         let steps = (i / 255 + 1) as u16;
         let mut fields = [0u16; 6];
-        for k in 0..6 {
-            fields[k] = (w.slots[slot][k] as u16 + steps) & ((1 << bc1::ENDPOINT_WIDTHS[k]) - 1);
+        for (k, field) in fields.iter_mut().enumerate() {
+            *field = (w.slots[slot][k] as u16 + steps) & ((1 << bc1::ENDPOINT_WIDTHS[k]) - 1);
         }
         let c0 = fields[0] << 11 | fields[1] << 5 | fields[2];
         let c1 = fields[3] << 11 | fields[4] << 5 | fields[5];

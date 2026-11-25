@@ -56,8 +56,49 @@ pub struct Model {
     /// Segment thresholds for the branch-free inverse: `base[k]` for enabled
     /// segments 1..nseg, `0x10000` (never reached) for disabled ones.
     thr: [u32; 10],
+    decode: OnceLock<DecodeTable>,
     /// Full inverse table (cf -> symbol), built on first use.
     lut: OnceLock<Box<[u16]>>,
+}
+
+/// Flat 64 KiB low-byte symbol table plus 2 KiB packed per-symbol `(freq, cf)`
+/// parameters. For 9-bit alphabets (`eab == 8`), `cf >= bit8_thr` restores
+/// symbol bit 8; for narrower alphabets `bit8_thr == 0x10000` so bit 8 is 0.
+#[derive(Clone, Debug)]
+struct DecodeTable {
+    sym_lo: Box<[u8; 65536]>,
+    params: Box<[u32; 512]>,
+    bit8_thr: u32,
+}
+
+impl DecodeTable {
+    fn build(m: &Model) -> Self {
+        let mut sym_lo: Box<[u8; 65536]> = vec![0u8; 65536]
+            .into_boxed_slice()
+            .try_into()
+            .expect("65536 bytes");
+        let mut params = Box::new([0u32; 512]);
+        for s in 0..(1u32 << (m.eab + 1)) {
+            let (f, cf) = m.forward(s as u16);
+            params[s as usize] = (f << 16) | cf;
+            let end = (cf + f).min(65536);
+            sym_lo[cf as usize..end as usize].fill(s as u8);
+        }
+        sym_lo[0] = m.inverse_exact(0) as u8;
+        Self {
+            sym_lo,
+            params,
+            bit8_thr: m.thr[9],
+        }
+    }
+
+    #[inline(always)]
+    fn entry(&self, cf: u16) -> (u16, u32, u32) {
+        let lo = self.sym_lo[cf as usize] as u16;
+        let sym = lo | (((u32::from(cf) >= self.bit8_thr) as u16) << 8);
+        let fc = self.params[sym as usize];
+        (sym, fc >> 16, fc & 0xFFFF)
+    }
 }
 
 impl Model {
@@ -67,6 +108,7 @@ impl Model {
             thr[k] = BASE_TABLE[eab][q][k] as u32;
         }
         Model {
+            decode: OnceLock::new(),
             thr,
             eab: eab as u8,
             q: q as u8,
@@ -78,6 +120,11 @@ impl Model {
             nseg: (eab + 2) as u8,
             lut: OnceLock::new(),
         }
+    }
+
+    #[inline]
+    fn decode_table(&self) -> &DecodeTable {
+        self.decode.get_or_init(|| DecodeTable::build(self))
     }
 
     /// The 65536-entry inverse table. Filled from the forward intervals
@@ -308,7 +355,7 @@ impl Lane {
 }
 
 /// Per-lane statistics of a successful decode.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneStats {
     pub bytes: u32,
     pub fragments: u32,
@@ -316,7 +363,7 @@ pub struct LaneStats {
 }
 
 /// Result of [`decode_lanes`]: `symbols[lane * target + i]` (lane major).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneOutput {
     pub lanes: usize,
     pub target: usize,
@@ -622,11 +669,58 @@ fn phase1(i: usize, ln: &mut Lane) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Fast decoder for the shared-stream case. Same clocked model as
-/// [`decode_lanes`] (the tests check both agree on synthetic and real
-/// streams), written with few data-dependent branches: the lanes spend almost
-/// every clock in PROCESSING, so that path is computed with selects and the
-/// rare state changes go through [`phase1`].
+/// Iterate requesting lanes in feeder priority order (lowest lane first).
+#[inline]
+fn lane_indices(mut mask: u32) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let i = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        Some(i)
+    })
+}
+
+#[repr(align(64))]
+struct FastLane {
+    p1: u32,
+    in_rem: u32,
+    out_rem: u32,
+    out_idx: usize,
+    table: &'static DecodeTable,
+    nbytes: u32,
+    nfrags: u32,
+    final_state: u32,
+    ib: u8,
+    state: u8,
+    ab: u8,
+    q: u8,
+    eab: u8,
+    ib_full: bool,
+    sym_full: bool,
+    hdr3: bool,
+    flush: bool,
+    done: bool,
+    go: bool,
+}
+
+impl FastLane {
+    #[inline(always)]
+    fn need_byte(&self) -> bool {
+        !self.ib_full
+            && match self.state {
+                HDR0 | HDR1 | HDR2 => true,
+                PROC => self.in_rem > 0,
+                _ => false,
+            }
+    }
+}
+
+/// Shared-stream version of [`decode_lanes`]. Bit masks track which lanes can
+/// accept input, hand off a symbol and run the next clock's state transition.
+/// Decoded symbols are stored eagerly at decode time; handoff and lockstep
+/// masks stay on their exact reference clocks.
 pub fn decode_lanes_fast(
     data: &[u8],
     alphabet_bits: &[u8],
@@ -646,146 +740,214 @@ pub fn decode_lanes_fast(
     if target == 0 || target > u32::MAX as usize / 2 {
         return Err(DecodeError::Invalid(format!("bad symbol count {target}")));
     }
+    let total_cap = n
+        .checked_mul(target)
+        .filter(|&c| {
+            c.checked_mul(std::mem::size_of::<u16>())
+                .is_some_and(|b| b <= isize::MAX as usize)
+        })
+        .ok_or_else(|| {
+            DecodeError::Invalid(format!("symbol buffer size overflow ({n} x {target})"))
+        })?;
     if data.is_empty() {
         return Err(DecodeError::NoProgress { consumed: 0 });
     }
-    // One spare slot per lane: the symbol store below writes unconditionally.
-    let stride = target
-        .checked_add(1)
-        .ok_or_else(|| DecodeError::Invalid(format!("bad symbol count {target}")))?;
-    let store_cap = n
-        .checked_mul(stride)
-        .filter(|&c| c.checked_mul(std::mem::size_of::<u16>()).is_some_and(|b| b <= isize::MAX as usize))
-        .ok_or_else(|| DecodeError::Invalid(format!("symbol buffer size overflow ({n} x {stride})")))?;
-    let mut store = Vec::new();
-    store
-        .try_reserve_exact(store_cap)
-        .map_err(|_| DecodeError::Invalid(format!("cannot allocate {store_cap} symbols")))?;
-    store.resize(store_cap, 0u16);
-    let m0 = model(0, 0);
-    let mut lanes: Vec<Lane> = alphabet_bits
-        .iter()
-        .map(|&ab| Lane {
-            ab,
-            target: target as u32,
-            state: IDLE,
-            ib: 0,
-            ib_full: false,
-            sym: 0,
-            sym_full: false,
-            in_rem: 0,
-            out_rem: 0,
-            p0: 0,
-            p1: 0,
-            hdr3: false,
-            flush: false,
-            q: 0,
-            eab: 0,
-            model: m0,
-            done: false,
-            go: true,
-            stall: false,
-            nsyms: 0,
-            nbytes: 0,
-            nfrags: 0,
-            final_state: 0,
-        })
-        .collect();
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(total_cap)
+        .map_err(|_| DecodeError::Invalid(format!("cannot allocate {total_cap} symbols")))?;
+    symbols.resize(total_cap, 0u16);
+    let t0 = model(0, 0).decode_table();
+    let mut lanes: [FastLane; MAX_LANES] = std::array::from_fn(|i| FastLane {
+        p1: 0,
+        in_rem: 0,
+        out_rem: 0,
+        out_idx: i * target,
+        table: t0,
+        nbytes: 0,
+        nfrags: 0,
+        final_state: 0,
+        ib: 0,
+        state: IDLE,
+        ab: alphabet_bits.get(i).copied().unwrap_or(0),
+        q: 0,
+        eab: 0,
+        ib_full: false,
+        sym_full: false,
+        hdr3: false,
+        flush: false,
+        done: false,
+        go: true,
+    });
+    let lanes = &mut lanes[..n];
     let len = data.len();
     let mut slots: u32 = 0;
     let mut pos: usize = 0;
     let mut cycle: u64 = 0;
     let max_cycles: u64 = 64u64
-        .saturating_mul((n as u64).saturating_mul(target as u64).saturating_add(len as u64))
+        .saturating_mul(
+            (n as u64)
+                .saturating_mul(target as u64)
+                .saturating_add(len as u64),
+        )
         .saturating_add(1000);
-    let mut total_syms: u64 = 0;
-    let mut last_prog = (usize::MAX, u64::MAX, u32::MAX);
     let mut last_change: u64 = 0;
 
+    let mut state_sum = 0u32;
+    // A done lane stays in lockstep until it hands off its final symbol.
+    let mut pending = (1u32 << n) - 1;
+    let mut proc_mask = 0u32;
+    let mut needs = 0u32;
+    let mut full = 0u32;
+
     while cycle < max_cycles {
-        // ---------------- phase 0 ----------------
-        let mut served = 0usize;
-        for (i, ln) in lanes.iter_mut().enumerate() {
-            let bit = 1u32 << i;
-            let st = ln.state;
-            let blocked_out = ln.sym_full & (slots & bit != 0);
-            let need =
-                !ln.ib_full & ((HDR0..=HDR2).contains(&st) | ((st == PROC) & (ln.in_rem > 0)));
-            let grant = need & !blocked_out & (served < FEED_WINDOW) & (pos < len);
-            let stall = (need & !grant) | blocked_out;
-            ln.stall = stall;
-            let go = !stall;
-            if st >= PROC {
-                let adv = ln.model.advance(ln.p1, ln.sym);
-                let np0 = if ln.sym_full { adv } else { ln.p1 };
-                ln.p0 = if go { np0 } else { ln.p0 };
+        // Steady-state PROC burst: while every pending lane is in PROC with at
+        // least 2 payload bytes and 2 symbols remaining and a full feed window
+        // available, no lane can change state or finish during the burst.
+        if pending != 0 && proc_mask == pending {
+            let mut min_rem = u32::MAX;
+            for i in lane_indices(pending) {
+                let ln = &lanes[i];
+                min_rem = min_rem.min(ln.in_rem).min(ln.out_rem);
             }
-            let b = data[pos.min(len - 1)];
-            ln.ib = if grant { b } else { ln.ib };
-            ln.ib_full |= grant;
-            pos += grant as usize;
-            served += grant as usize;
-            ln.nbytes += grant as u32;
-            let push = go & ln.sym_full;
-            // nsyms <= target, and slot `target` is the spare.
-            unsafe { *store.get_unchecked_mut(i * stride + ln.nsyms as usize) = ln.sym };
-            ln.nsyms += push as u32;
-            total_syms += push as u64;
-            slots |= (push as u32) << i;
-            ln.sym_full &= !push;
-        }
-        // ---------------- phase 1 ----------------
-        let mut active = 0u32;
-        let mut finished = true;
-        let mut state_sum = 0u32;
-        for (i, ln) in lanes.iter_mut().enumerate() {
-            if !ln.stall {
-                let st = ln.state;
-                if st >= PROC {
-                    let is_proc = st == PROC;
-                    let will = is_proc & (ln.p0 < L) & (ln.in_rem > 0) & ln.ib_full;
-                    let x = if will {
-                        (ln.p0 << 8) | ln.ib as u32
-                    } else {
-                        ln.p0
-                    };
-                    let nsf = (x > L) & (ln.out_rem > 0);
-                    ln.sym = ln.model.inverse_fast(x as u16);
-                    ln.out_rem -= nsf as u32;
-                    ln.p1 = x;
-                    ln.sym_full = nsf;
-                    ln.in_rem -= will as u32;
-                    ln.ib_full &= !will;
-                    let change = if is_proc { ln.in_rem == 0 } else { x <= L };
-                    if change {
-                        transition(ln, x, nsf);
+            let avail_feeds = (len - pos) / FEED_WINDOW;
+            let burst = (min_rem.saturating_sub(1) as usize)
+                .min(avail_feeds)
+                .min((max_cycles - cycle) as usize);
+            if burst > 0 {
+                for _ in 0..burst {
+                    let blocked = full & slots;
+                    let mut requests = needs & !blocked;
+                    let win = &data[pos..pos + FEED_WINDOW];
+                    let mut fed = 0usize;
+                    while requests != 0 && fed < FEED_WINDOW {
+                        let i = requests.trailing_zeros() as usize;
+                        requests &= requests - 1;
+                        let ln = &mut lanes[i];
+                        ln.ib = win[fed];
+                        ln.nbytes += 1;
+                        fed += 1;
                     }
-                } else {
-                    phase1(i, ln)?;
+                    pos += fed;
+                    let stalled = blocked | requests;
+                    let run = pending & !stalled;
+                    let pushes = full & run;
+                    slots |= pushes;
+                    needs &= stalled;
+                    full &= stalled;
+                    for i in lane_indices(run) {
+                        let ln = &mut lanes[i];
+                        let take = ln.p1 < L;
+                        let x = if take {
+                            ln.in_rem -= 1;
+                            needs |= 1u32 << i;
+                            (ln.p1 << 8) | ln.ib as u32
+                        } else {
+                            ln.p1
+                        };
+                        if x > L {
+                            let (sym, freq, cf) = ln.table.entry(x as u16);
+                            symbols[ln.out_idx] = sym;
+                            ln.out_idx += 1;
+                            ln.out_rem -= 1;
+                            ln.p1 = freq
+                                .wrapping_mul(x >> 16)
+                                .wrapping_add(x & 0xFFFF)
+                                .wrapping_sub(cf);
+                            full |= 1u32 << i;
+                        } else {
+                            ln.p1 = x;
+                        }
+                    }
+                    if slots & pending == pending {
+                        slots = 0;
+                    }
+                    cycle += 1;
+                    if fed != 0 || pushes != 0 {
+                        last_change = cycle;
+                    } else if cycle - last_change > 64 {
+                        return Err(DecodeError::NoProgress { consumed: pos });
+                    }
+                }
+                for i in lane_indices(pending) {
+                    let bit = 1u32 << i;
+                    lanes[i].ib_full = (needs & bit) == 0;
+                    lanes[i].sym_full = (full & bit) != 0;
+                }
+                continue;
+            }
+        }
+
+        // Phase 0. The low bits win the feeder in lane order. Unserved
+        // requests and occupied output slots hold the entire lane for a clock.
+        let pos_before = pos;
+        let prev_state_sum = state_sum;
+        let blocked = full & slots;
+        let mut requests = needs & !blocked;
+        let end = (pos + FEED_WINDOW).min(len);
+        while requests != 0 && pos < end {
+            let i = requests.trailing_zeros() as usize;
+            requests &= requests - 1;
+            lanes[i].ib = data[pos];
+            lanes[i].ib_full = true;
+            lanes[i].nbytes += 1;
+            pos += 1;
+        }
+        let stalled = blocked | requests;
+        let pushes = full & !stalled;
+        slots |= pushes;
+        // Phase 1. Stalled lanes retain both buffer flags. The others have
+        // handed off their old symbol and compute the flags for the next clock.
+        needs &= stalled;
+        full &= stalled;
+        for i in lane_indices(pending & !stalled) {
+            let ln = &mut lanes[i];
+            let old_state = ln.state;
+            match old_state {
+                PROC => {
+                    // An unstalled PROCESSING lane always has a buffered byte.
+                    let take = ln.p1 < L;
+                    let x = decode_step(ln, take, &mut symbols);
+                    full |= (ln.sym_full as u32) << i;
+                    if ln.in_rem != 0 {
+                        needs |= (take as u32) << i;
+                        continue;
+                    }
+                    transition(ln, x);
+                    proc_mask &= !(1u32 << i);
+                }
+                DRAIN => {
+                    let x = decode_step(ln, false, &mut symbols);
+                    full |= (ln.sym_full as u32) << i;
+                    if x > L {
+                        continue;
+                    }
+                    transition(ln, x);
+                }
+                _ => {
+                    ln.sym_full = false;
+                    fast_phase1_hdr(i, ln, target as u32)?;
+                    if ln.state == PROC {
+                        proc_mask |= 1u32 << i;
+                    }
                 }
             }
-            let bit = 1u32 << i;
-            if !(ln.done & !ln.sym_full & (slots & bit == 0)) {
-                active |= bit;
+            state_sum = state_sum - old_state as u32 + ln.state as u32;
+            if ln.done && !ln.sym_full {
+                pending &= !(1 << i);
             }
-            finished &= ln.done & !ln.sym_full;
-            state_sum += ln.state as u32;
+            needs |= (ln.need_byte() as u32) << i;
         }
-        if slots != 0 && (slots & active) == active {
+        if slots & pending == pending {
             slots = 0;
         }
         cycle += 1;
-        if finished {
+        if pending == 0 {
             let bad: Vec<usize> = (0..n)
                 .filter(|&i| !is_legal_end_state(lanes[i].final_state))
                 .collect();
             if !bad.is_empty() {
                 return Err(DecodeError::IllegalEndState { lanes: bad });
-            }
-            let mut symbols = vec![0u16; n * target];
-            for i in 0..n {
-                symbols[i * target..(i + 1) * target]
-                    .copy_from_slice(&store[i * stride..i * stride + target]);
             }
             let stats = lanes
                 .iter()
@@ -804,9 +966,7 @@ pub fn decode_lanes_fast(
                 stats,
             });
         }
-        let prog = (pos, total_syms, state_sum);
-        if prog != last_prog {
-            last_prog = prog;
+        if cycle == 1 || pos != pos_before || pushes != 0 || state_sum != prev_state_sum {
             last_change = cycle;
         } else if cycle - last_change > 64 {
             return Err(DecodeError::NoProgress { consumed: pos });
@@ -815,35 +975,103 @@ pub fn decode_lanes_fast(
     Err(DecodeError::CycleLimit)
 }
 
+/// Phase 1 for IDLE/HDR0/HDR1/HDR2 on a fast lane.
+#[cold]
+fn fast_phase1_hdr(i: usize, ln: &mut FastLane, target: u32) -> Result<(), DecodeError> {
+    match ln.state {
+        IDLE => {
+            if ln.go {
+                ln.go = false;
+                ln.state = HDR0;
+                ln.out_rem = target;
+                ln.p1 = 0;
+            }
+        }
+        HDR0 => {
+            if ln.ib_full {
+                let b = ln.ib;
+                ln.ib_full = false;
+                ln.in_rem = 0;
+                ln.state = HDR1;
+                ln.q = b & 15;
+                ln.hdr3 = b & 0x20 != 0;
+                ln.flush = b & 0x10 != 0;
+                let e = (ln.ab as i32 - (b >> 6) as i32) & 15;
+                ln.eab = if e < 10 { e as u8 } else { 9 };
+                ln.nfrags += 1;
+                if ln.eab > 8 {
+                    return Err(DecodeError::BadHeader {
+                        lane: i,
+                        eab: ln.eab,
+                    });
+                }
+            }
+        }
+        HDR1 => {
+            if ln.ib_full {
+                ln.ib_full = false;
+                ln.table = model(ln.eab, ln.q).decode_table();
+                if ln.hdr3 {
+                    ln.in_rem = ln.ib as u32;
+                    ln.state = HDR2;
+                } else {
+                    ln.in_rem = ln.ib as u32 + 1;
+                    ln.state = PROC;
+                }
+            }
+        }
+        HDR2 => {
+            if ln.ib_full {
+                ln.ib_full = false;
+                ln.in_rem = (((ln.ib as u32) << 8) | (ln.in_rem & 0xFF)) + 257;
+                ln.state = PROC;
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn decode_step(ln: &mut FastLane, take: bool, symbols: &mut [u16]) -> u32 {
+    let x = if take {
+        (ln.p1 << 8) | ln.ib as u32
+    } else {
+        ln.p1
+    };
+    ln.ib_full &= !take;
+    ln.in_rem -= take as u32;
+    ln.sym_full = x > L && ln.out_rem != 0;
+    ln.p1 = x;
+    if ln.sym_full {
+        let (sym, freq, cf) = ln.table.entry(x as u16);
+        symbols[ln.out_idx] = sym;
+        ln.out_idx += 1;
+        ln.out_rem -= 1;
+        // The next phase 0 would advance this state on hand-off. Stalls
+        // freeze it, so we can use the same table entry to advance it here.
+        ln.p1 = freq
+            .wrapping_mul(x >> 16)
+            .wrapping_add(x & 0xFFFF)
+            .wrapping_sub(cf);
+    }
+    x
+}
+
 /// End of a fragment's input (PROCESSING) or of draining: same rules as [`phase1`].
 #[cold]
-fn transition(ln: &mut Lane, x: u32, nsf: bool) {
-    let new_out = ln.out_rem;
-    if ln.state == PROC {
-        if new_out > 0 {
-            if x == L {
-                ln.state = HDR0;
-                if ln.flush {
-                    ln.p1 = 0;
-                }
-            } else {
-                ln.state = DRAIN;
-            }
-        } else {
-            ln.done = true;
-            ln.state = IDLE;
-            ln.final_state = if nsf { ln.model.advance(x, ln.sym) } else { x };
-        }
-    } else if new_out > 0 {
+fn transition(ln: &mut FastLane, x: u32) {
+    if ln.out_rem == 0 {
+        ln.done = true;
+        ln.state = IDLE;
+        ln.final_state = ln.p1;
+    } else if ln.state == PROC && x != L {
+        ln.state = DRAIN;
+    } else {
         ln.state = HDR0;
         if ln.flush {
-            ln.p0 = 0;
             ln.p1 = 0;
         }
-    } else {
-        ln.state = IDLE;
-        ln.done = true;
-        ln.final_state = if nsf { ln.model.advance(x, ln.sym) } else { x };
     }
 }
 
@@ -875,18 +1103,18 @@ mod tests {
         for eab in 0..9u8 {
             for q in 0..16u8 {
                 let m = model(eab, q);
-                assert_eq!(m.inverse(0), m.inverse_exact(0));
-                assert_eq!(m.inverse_fast(0), m.inverse_exact(0));
-                for cf in 1..=0xFFFFu32 {
+                for cf in 0..=0xFFFFu32 {
                     let s = m.inverse(cf as u16);
                     assert_eq!(s, m.inverse_exact(cf as u16), "eab {eab} q {q} cf {cf}");
-                    assert_eq!(
-                        s,
-                        m.inverse_fast(cf as u16),
-                        "fast: eab {eab} q {q} cf {cf}"
-                    );
+                    assert_eq!(s, m.inverse_fast(cf as u16));
+                    let (sym, freq, cf_base) = m.decode_table().entry(cf as u16);
+                    assert_eq!(sym, s);
                     let (f, c) = m.forward(s);
-                    assert!(c <= cf && cf < c + f, "eab {eab} q {q} cf {cf} sym {s}");
+                    assert_eq!((freq, cf_base), (f, c));
+                    assert!(
+                        cf == 0 || (c <= cf && cf < c + f),
+                        "eab {eab} q {q} cf {cf} sym {s}"
+                    );
                 }
             }
         }
