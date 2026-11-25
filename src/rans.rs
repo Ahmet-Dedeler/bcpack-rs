@@ -762,7 +762,7 @@ pub fn decode_lanes_fast(
         p1: 0,
         in_rem: 0,
         out_rem: 0,
-        out_idx: i * target,
+        out_idx: if i < n { i * target } else { 0 },
         table: t0,
         nbytes: 0,
         nfrags: 0,
