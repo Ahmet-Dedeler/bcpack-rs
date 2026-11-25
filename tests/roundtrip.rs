@@ -181,6 +181,43 @@ fn semantics_by_hand() {
 }
 
 #[test]
+fn prediction_chains_cross_history_wraps() {
+    let (mut w, _) = test_tables();
+    w.fitted[1] = false;
+    let q = QuadTable::from_codes([[0; 4]; 256]);
+    let n = 1025;
+    let mut symbols = vec![0u16; 12 * n];
+    symbols[..n].fill(1); // d = 255, the longest reference distance.
+    symbols[2 * n..8 * n].fill(2); // +1 on every endpoint field.
+    let lanes = rans::LaneOutput {
+        lanes: 12,
+        target: n,
+        symbols,
+        consumed: 0,
+        cycles: 0,
+        stats: vec![],
+    };
+    let out = bc1::assemble(&lanes, &w, &q);
+    for (i, block) in out.blocks.chunks_exact(8).enumerate() {
+        // Each chain starts in slots 1..=255 and gains one every 255 blocks.
+        let slot = i % 255 + 1;
+        let steps = (i / 255 + 1) as u16;
+        let mut fields = [0u16; 6];
+        for k in 0..6 {
+            fields[k] = (w.slots[slot][k] as u16 + steps) & ((1 << bc1::ENDPOINT_WIDTHS[k]) - 1);
+        }
+        let c0 = fields[0] << 11 | fields[1] << 5 | fields[2];
+        let c1 = fields[3] << 11 | fields[4] << 5 | fields[5];
+        assert_eq!(&block[..2], &c0.to_le_bytes(), "block {i}");
+        assert_eq!(&block[2..4], &c1.to_le_bytes(), "block {i}");
+        assert_eq!(&block[4..], &[0; 4], "block {i}");
+    }
+    assert_eq!(out.blocks.len(), n * 8);
+    assert_eq!(out.prestart_refs, 255);
+    assert_eq!(out.unfitted_blocks, 5); // Blocks 0, 255, 510, 765 and 1020.
+}
+
+#[test]
 fn golden_hashes() {
     // Synthetic streams decoded with the test tables. A change here means the
     // decoder's output changed.
