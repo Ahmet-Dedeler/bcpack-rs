@@ -199,8 +199,9 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
         lanes.lane(7),
     ];
     let idx: [&[u16]; 4] = [lanes.lane(8), lanes.lane(9), lanes.lane(10), lanes.lane(11)];
-    let mut fields: Vec<[u8; 6]> = vec![[0; 6]; n];
-    let mut tainted: Vec<bool> = vec![false; n];
+    // References reach back at most 255 blocks; keep a 256-slot history ring.
+    let mut fields = [[0u8; 6]; 256];
+    let mut tainted = [false; 256];
     let mut out = vec![0u8; n * 8];
     let mut unfitted = 0usize;
     let mut prestart = 0usize;
@@ -209,7 +210,7 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
         let (pred, t) = if d == 0 {
             ([0u8; 6], false)
         } else if d <= i {
-            (fields[i - d], tainted[i - d])
+            (fields[(i - d) & 255], tainted[(i - d) & 255])
         } else {
             prestart += 1;
             let slot = (i as isize - d as isize).rem_euclid(256) as usize;
@@ -220,8 +221,8 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
             let m = (1i32 << ENDPOINT_WIDTHS[k]) - 1;
             e[k] = ((pred[k] as i32 + unzigzag(res[k][i])) & m) as u8;
         }
-        fields[i] = e;
-        tainted[i] = t;
+        fields[i & 255] = e;
+        tainted[i & 255] = t;
         unfitted += t as usize;
         let c0 = (e[0] as u16) << 11 | (e[1] as u16) << 5 | e[2] as u16;
         let c1 = (e[3] as u16) << 11 | (e[4] as u16) << 5 | e[5] as u16;
