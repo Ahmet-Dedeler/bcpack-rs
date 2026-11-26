@@ -104,13 +104,23 @@ impl Store {
             let end = ((a2 & 0x3FF_FFFF) as u64) << 8;
             let v = (((a >> 30) as u64) | (((b & 0xFFFFF) as u64) << 2)) << 12;
             let v2 = (((a2 >> 30) as u64) | (((b2 & 0xFFFFF) as u64) << 2)) << 12;
+            let file_len = end
+                .checked_sub(off)
+                .ok_or_else(|| bad(format!("chunk {i}: backwards file range")))?;
+            let vlen = v2
+                .checked_sub(v)
+                .ok_or_else(|| bad(format!("chunk {i}: backwards virtual range")))?;
+            let pad = (b >> 20) as u64;
+            if pad > file_len {
+                return Err(bad(format!("chunk {i}: padding exceeds stored length")));
+            }
             chunks.push(Chunk {
                 index: i,
                 file_off: off,
-                file_len: end.saturating_sub(off),
-                pad: (b >> 20) as u64,
+                file_len,
+                pad,
                 vstart: v,
-                vlen: v2.saturating_sub(v),
+                vlen,
                 codec: ((a >> 24) & 0x3C) as u8,
             });
         }
@@ -577,6 +587,77 @@ pub fn png_rgba(rgba: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two chunk-table entries: one stored chunk and its end sentinel.
+    fn synthetic_store(start: (u32, u32, u32), end: (u32, u32, u32)) -> Vec<u8> {
+        let mut data = vec![0u8; 0x300];
+        data[..4].copy_from_slice(b"RDS5");
+        data[4..8].copy_from_slice(&2u32.to_le_bytes());
+        data[8..12].copy_from_slice(&0x8000u32.to_le_bytes());
+        for (i, (file_off, virtual_off, pad)) in [start, end].into_iter().enumerate() {
+            let a = (file_off >> 8) | (((virtual_off >> 12) & 3) << 30);
+            let b = (virtual_off >> 14) | (pad << 20);
+            let at = 0x18 + i * 8;
+            data[at..at + 4].copy_from_slice(&a.to_le_bytes());
+            data[at + 4..at + 8].copy_from_slice(&b.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn store_accepts_ordered_chunk_ranges() {
+        let data = synthetic_store((0x100, 0, 4), (0x300, 0x4000, 0));
+        let store = Store::from_bytes(data).unwrap();
+        assert_eq!(store.chunks[0].file_len, 0x200);
+        assert_eq!(store.chunks[0].vlen, 0x4000);
+        assert_eq!(store.chunk_bytes(0, false).unwrap().len(), 0x1FC);
+        assert_eq!(store.locate(0, 0x4000).unwrap(), [(0, 0, 0x4000)]);
+    }
+
+    #[test]
+    fn store_rejects_backwards_file_ranges() {
+        let data = synthetic_store((0x200, 0, 0), (0x100, 0x4000, 0));
+        assert!(Store::from_bytes(data).is_err());
+    }
+
+    #[test]
+    fn store_rejects_backwards_virtual_ranges() {
+        let data = synthetic_store((0x100, 0x4000, 0), (0x200, 0x3000, 0));
+        assert!(Store::from_bytes(data).is_err());
+    }
+
+    #[test]
+    fn store_rejects_padding_larger_than_the_chunk() {
+        let data = synthetic_store((0x100, 0, 0x101), (0x200, 0x4000, 0));
+        assert!(Store::from_bytes(data).is_err());
+    }
+
+    #[test]
+    fn store_checks_file_bounds_when_reading_chunk() {
+        let data = synthetic_store((0x100, 0, 0), (0x400, 0x4000, 0));
+        let store = Store::from_bytes(data).unwrap();
+        assert_eq!(
+            store.chunk_bytes(0, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn store_accepts_empty_chunk_ranges() {
+        let data = synthetic_store((0x100, 0x4000, 0), (0x100, 0x4000, 0));
+        let store = Store::from_bytes(data).unwrap();
+        assert_eq!(store.chunks[0].file_len, 0);
+        assert_eq!(store.chunks[0].vlen, 0);
+        assert!(store.chunk_bytes(0, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_accepts_a_fully_padded_chunk() {
+        let data = synthetic_store((0x100, 0, 0x100), (0x200, 0, 0));
+        let store = Store::from_bytes(data).unwrap();
+        assert_eq!(store.chunk_bytes(0, true).unwrap().len(), 0x100);
+        assert!(store.chunk_bytes(0, false).unwrap().is_empty());
+    }
 
     #[test]
     fn untile_is_a_permutation() {
