@@ -44,9 +44,9 @@ fn test_tables() -> (Window, QuadTable) {
         slots: [[0; 6]; 256],
         fitted: [true; 256],
     };
-    for s in 0..256 {
-        for k in 0..6 {
-            w.slots[s][k] = ((s * 7 + k * 13) % (1 << bc1::ENDPOINT_WIDTHS[k])) as u8;
+    for (s, slot) in w.slots.iter_mut().enumerate() {
+        for (k, v) in slot.iter_mut().enumerate() {
+            *v = ((s * 7 + k * 13) % (1 << bc1::ENDPOINT_WIDTHS[k])) as u8;
         }
     }
     let mut codes = [[0u8; 4]; 256];
@@ -375,8 +375,8 @@ fn default_tables_load() {
         assert!(seen.insert(*c), "codebook must be a bijection");
     }
     // symbols 0-3 are the uniform quadrants, code = sym ^ 2 (measured exactly)
-    for s in 0..4 {
-        assert_eq!(q.codes[s], [(s ^ 2) as u8; 4]);
+    for (s, code) in q.codes.iter().take(4).enumerate() {
+        assert_eq!(*code, [(s ^ 2) as u8; 4]);
     }
 }
 
