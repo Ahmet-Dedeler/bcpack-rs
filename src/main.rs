@@ -20,9 +20,9 @@ Usage:
   bcpack symbols [--format FORMAT] <chunk.bin> <blocks>
       Print the decoded lane symbol streams, one line per lane.
   bcpack ttpf-export <store.ttpf> <texture_index> <out.dds|out.png>
-      Decode and detile mip 0 to DDS (all five formats) or PNG (BC1).
+      Decode and detile mip 0 to DDS or PNG (BC1, BC3, BC4, BC5, BC7).
   bcpack scan [--jobs N] [--every K] [--max-blocks N] [--emit DIR] <store.ttpf>...
-      Decode every K-th BC1 chunk and report convergence and speed.
+      Sample every K-th chunk within each supported format and report convergence and speed.
   bcpack bench [--format FORMAT] <chunk.bin> <blocks> [seconds]
       Single-thread decode speed on one chunk.
   FORMAT is bc1 (default), bc3, bc4, bc5 or bc7.
@@ -203,20 +203,33 @@ fn cmd_export(o: &Opts) {
         .unwrap_or_else(|| die(format!("store has {} textures", texs.len())));
     let out = &o.pos[2];
     let png = out.to_ascii_lowercase().ends_with(".png");
-    if png && !bcpack::BC1_DXGI.contains(&tex.dxgi) {
-        die("PNG export requires BC1; use .dds for other supported formats");
-    }
+    let (mode, signed) = bcpack::pixels::mode_from_dxgi(tex.dxgi)
+        .unwrap_or_else(|| die(format!("unsupported DXGI format {}", tex.dxgi)));
     let m = bcpack::texture_mip0(&store, tex, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     let bytes = if png {
-        let rgba = ttpf::bc1_to_rgba(&m.blocks, m.bw, m.bh, m.width as usize, m.height as usize);
-        ttpf::png_rgba(&rgba, m.width, m.height).unwrap_or_else(|e| die(e))
+        let rgba = bcpack::pixels::blocks_to_rgba(
+            mode,
+            signed,
+            &m.blocks,
+            m.bw,
+            m.bh,
+            m.width as usize,
+            m.height as usize,
+        )
+        .unwrap_or_else(|e| die(e));
+        let srgb = matches!(tex.dxgi, 72 | 78 | 99);
+        ttpf::png_rgba_with_srgb(&rgba, m.width, m.height, srgb).unwrap_or_else(|e| die(e))
     } else {
         ttpf::dds(&m.blocks, m.width, m.height, tex.dxgi).unwrap_or_else(|e| die(e))
     };
     std::fs::write(out, bytes).unwrap_or_else(|e| die(e));
     eprintln!(
-        "texture {ti}: {}x{}, {} BCPack chunk(s), {} blocks depend on unfitted table entries",
-        m.width, m.height, m.bcpack_chunks, m.unfitted_blocks
+        "texture {ti}: {}x{} {}, {} BCPack chunk(s), {} blocks depend on unfitted table entries",
+        m.width,
+        m.height,
+        mode.name().to_ascii_uppercase(),
+        m.bcpack_chunks,
+        m.unfitted_blocks
     );
 }
 
@@ -226,6 +239,7 @@ struct Tally {
     ok: usize,
     blocks: u64,
     in_bytes: u64,
+    out_bytes: u64,
     exact_len: usize,
     clean: usize,
     errors: BTreeMap<String, usize>,
@@ -239,6 +253,7 @@ impl Tally {
         self.ok += t.ok;
         self.blocks += t.blocks;
         self.in_bytes += t.in_bytes;
+        self.out_bytes += t.out_bytes;
         self.exact_len += t.exact_len;
         self.clean += t.clean;
         self.secs += t.secs;
@@ -264,6 +279,7 @@ fn cmd_scan(o: &Opts) {
     }
     let t0 = Instant::now();
     let mut total = Tally::default();
+    let mut total_by_mode: BTreeMap<Mode, Tally> = BTreeMap::new();
     let mut stem_counts: BTreeMap<String, usize> = BTreeMap::new();
     for path in &o.pos {
         let s = Path::new(path)
@@ -280,14 +296,25 @@ fn cmd_scan(o: &Opts) {
                 continue;
             }
         };
-        let ids: Vec<usize> = store
+        let mut skip_by_mode = BTreeMap::<Mode, usize>::new();
+        let chunks: Vec<_> = store
             .chunks
             .iter()
-            .filter(|c| {
-                c.codec == ttpf::CODEC_BC1 && c.vlen >= 8 && (c.vlen / 8) as usize <= o.max_blocks
+            .filter_map(|c| {
+                let mode = Mode::from_codec(c.codec).filter(|m| *m != Mode::Bc6h)?;
+                let blocks = usize::try_from(c.vlen / mode.block_bytes() as u64).ok()?;
+                if blocks == 0 || blocks > o.max_blocks {
+                    return None;
+                }
+                // Keep the same BC1 sample even when a store mixes formats.
+                let skip = skip_by_mode.entry(mode).or_default();
+                if *skip > 0 {
+                    *skip -= 1;
+                    return None;
+                }
+                *skip = o.every - 1;
+                Some((c.index, mode, blocks))
             })
-            .map(|c| c.index)
-            .step_by(o.every)
             .collect();
         let raw_stem = Path::new(path)
             .file_stem()
@@ -298,11 +325,10 @@ fn cmd_scan(o: &Opts) {
         } else {
             raw_stem
         };
-        let tallies: Vec<Tally> = ids
+        let tallies: Vec<(Mode, Tally)> = chunks
             .par_iter()
-            .map(|&ci| {
+            .map(|&(ci, mode, blocks)| {
                 let c = &store.chunks[ci];
-                let blocks = (c.vlen / 8) as usize;
                 let mut t = Tally {
                     chunks: 1,
                     ..Default::default()
@@ -311,22 +337,22 @@ fn cmd_scan(o: &Opts) {
                     Ok(r) => r,
                     Err(e) => {
                         *t.errors.entry(format!("read: {e}")).or_default() += 1;
-                        return t;
+                        return (mode, t);
                     }
                 };
                 let s = Instant::now();
-                let r = bc1::decode_symbols(raw, blocks);
+                let r = decode_chunk(mode, raw, blocks, &o.window, &o.quads);
                 match r {
-                    Ok(lanes) => {
-                        let out = bc1::assemble(&lanes, &o.window, &o.quads);
+                    Ok(out) => {
                         t.secs = s.elapsed().as_secs_f64();
                         t.ok = 1;
                         t.blocks = blocks as u64;
-                        t.in_bytes = lanes.consumed as u64;
-                        t.exact_len = (lanes.consumed as u64 == c.data_len()) as usize;
+                        t.out_bytes = out.blocks.len() as u64;
+                        t.in_bytes = out.consumed as u64;
+                        t.exact_len = (out.consumed as u64 == c.data_len()) as usize;
                         t.clean = (out.unfitted_blocks == 0) as usize;
                         if let Some(d) = &o.emit {
-                            let p = d.join(format!("{stem}_{ci}.bc1"));
+                            let p = d.join(format!("{stem}_{ci}.{}", mode.name()));
                             if let Err(e) = std::fs::write(&p, &out.blocks) {
                                 eprintln!("{}: {e}", p.display());
                                 *t.errors.entry(format!("emit: {e}")).or_default() += 1;
@@ -346,23 +372,39 @@ fn cmd_scan(o: &Opts) {
                         *t.fail_by_blocks.entry(blocks).or_default() += 1;
                     }
                 }
-                t
+                (mode, t)
             })
             .collect();
         let mut st = Tally::default();
-        for t in &tallies {
+        let mut by_mode: BTreeMap<Mode, Tally> = BTreeMap::new();
+        for (mode, t) in &tallies {
             st.add(t);
+            by_mode.entry(*mode).or_default().add(t);
         }
         println!(
             "{path}: {}/{} converged, {} blocks, consumed == data length in {}, chunks with every block fitted {}",
             st.ok, st.chunks, st.blocks, st.exact_len, st.clean
         );
+        for (mode, t) in &by_mode {
+            println!(
+                "  {}: {}/{} converged, {} blocks, consumed == data length in {}, chunks with every block fitted {}",
+                mode.name(),
+                t.ok,
+                t.chunks,
+                t.blocks,
+                t.exact_len,
+                t.clean
+            );
+        }
         total.add(&st);
+        for (mode, t) in by_mode {
+            total_by_mode.entry(mode).or_default().add(&t);
+        }
     }
     let wall = t0.elapsed().as_secs_f64();
     println!(
         "TOTAL {}/{} converged ({} failed); {} blocks; consumed == data length in {}/{}; \
-         chunks touching no unfitted window slot {}/{}",
+         chunks touching no unfitted table entry {}/{}",
         total.ok,
         total.chunks,
         total.chunks - total.ok,
@@ -372,16 +414,39 @@ fn cmd_scan(o: &Opts) {
         total.clean,
         total.ok
     );
+    for (mode, t) in &total_by_mode {
+        println!(
+            "TOTAL {}: {}/{} converged ({} failed); {} blocks; consumed == data length in {}/{}; \
+             chunks touching no unfitted table entry {}/{}",
+            mode.name(),
+            t.ok,
+            t.chunks,
+            t.chunks - t.ok,
+            t.blocks,
+            t.exact_len,
+            t.ok,
+            t.clean,
+            t.ok
+        );
+        if t.secs > 0.0 {
+            println!(
+                "  {} speed per thread: {:.1} MB/s compressed in, {:.1} MB/s blocks out",
+                mode.name(),
+                t.in_bytes as f64 / t.secs / 1e6,
+                t.out_bytes as f64 / t.secs / 1e6
+            );
+        }
+    }
     if !total.errors.is_empty() {
         println!("errors: {:?}", total.errors);
         println!("failures by block count: {:?}", total.fail_by_blocks);
     }
     if total.secs > 0.0 {
         println!(
-            "decode wall time summed over chunks {:.2} s: {:.1} MB/s compressed in, {:.1} MB/s BC1 out per thread; total wall {:.1} s (incl. reading stores)",
+            "decode wall time summed over chunks {:.2} s: {:.1} MB/s compressed in, {:.1} MB/s blocks out per thread; total wall {:.1} s (incl. reading stores)",
             total.secs,
             total.in_bytes as f64 / total.secs / 1e6,
-            total.blocks as f64 * 8.0 / total.secs / 1e6,
+            total.out_bytes as f64 / total.secs / 1e6,
             wall
         );
     }
