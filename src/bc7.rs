@@ -499,11 +499,11 @@ pub fn unpack(block: &[u8]) -> Option<(Control, State)> {
             raw[e / 2][e % 2] |= take(1);
         }
     }
-    for row in 0..subsets {
+    for (ep, raw_row) in st.ep.iter_mut().zip(raw).take(subsets) {
         for col in 0..8 {
             let p = prec[col / 2];
             if p != 0 {
-                st.ep[row][col] = (raw[row][col] << (8 - p)) as u8;
+                ep[col] = (raw_row[col] << (8 - p)) as u8;
             }
         }
     }

@@ -12,14 +12,14 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1, BC3, BC4, BC5 and BC7 decode in the Rust library.** The `bcpack` CLI, whole-texture `ttpf-export` (Gfx10 detiling + DDS/PNG), synthetic stream encoder, and Python reference currently handle **BC1** only. **BC6H** has its entropy layer solved (16 lanes in `src/format.rs`), with block rebuild not implemented yet.
+**BC1, BC3, BC4, BC5 and BC7 decode in the Rust library and CLI.** The synthetic stream encoder and whole-texture DDS export support all five formats. PNG export, store scanning and the Python reference handle BC1. **BC6H** has its entropy layer solved (16 lanes in `src/format.rs`), with block rebuild not implemented yet.
 
 | Part | Status |
 |---|---|
 | Entropy layer (rANS) | **Exact.** Microsoft's MDU tables from the public [`silicon-rans`](https://github.com/microsoft/silicon-rans) Verilog (MIT), a clock-for-clock port of its lane decoder, bytes fed in lane order (8 per clock) with all lanes (12 or 16) in lockstep. Every lane must consume exactly its byte budget and end in a legal state, so a wrong rule fails loudly |
 | BC1 (`bcpack::bc1`, CLI, Python) | **Decodes.** Endpoints verified (back-reference distance + zigzag residuals), complete 255-entry preset window (`data/bc1_window.json`), fitted 256-entry quadrant index codebook (`data/bc1_quad_table.json`; two independent fits agree on 248/256 entries, 99.76% of quadrants, 8 rare mirror pairs uncertain). Stream order = standard Gfx10 tiled order |
-| BC3, BC4, BC5 (`bcpack::bcn`) | **Decodes (library).** Exact block rebuild rules and complete constant tables (`data/bc3.json`, `bc4.json`, `bc5.json`: 64-entry alpha pair ranks, BC3 256-entry colour quadrant ranks, 255-entry dictionaries). Byte-identical to a reference decoder on all 35 BC3 (660,992 blocks), 77 BC4 (201,728 blocks) and 333 BC5 (4,890,368 blocks) chunks across 57 stores, and independently validated on 100 BC5 + 1 BC3 chunks in issue #5. Not wired into the CLI, `ttpf-export` or Python yet |
-| BC7 (`bcpack::bc7`) | **Decodes (library).** 16 lanes (widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`), two symbols per lane per 16-byte block, exact block rebuild, all 285 control codes and the 255-entry single-subset dictionary (`data/bc7.json`). Byte-identical to a reference decoder on all 5,167 BC7 chunks (80,055,040 blocks) across 57 stores, and independently validated on 28 chunks in issue #5. Not wired into the CLI, `ttpf-export` or Python yet |
+| BC3, BC4, BC5 (`bcpack::bcn`) | **Decodes.** Exact block rebuild rules and complete constant tables (`data/bc3.json`, `bc4.json`, `bc5.json`: 64-entry alpha pair ranks, BC3 256-entry colour quadrant ranks, 255-entry dictionaries). Byte-identical to a reference decoder on all 35 BC3 (660,992 blocks), 77 BC4 (201,728 blocks) and 333 BC5 (4,890,368 blocks) chunks across 57 stores, and independently validated on 100 BC5 + 1 BC3 chunks in issue #5. |
+| BC7 (`bcpack::bc7`) | **Decodes.** 16 lanes (widths `4,4,8,8,8,8,8,7,7,5,6,8,8,8,8,5`), two symbols per lane per 16-byte block, exact block rebuild, all 285 control codes and the 255-entry single-subset dictionary (`data/bc7.json`). Byte-identical to a reference decoder on all 5,167 BC7 chunks (80,055,040 blocks) across 57 stores, and independently validated on 28 chunks in issue #5. |
 | BC6H (`bcpack::format::Mode::Bc6h`) | **Entropy layer only.** 16 lanes (widths `4,4,8,8,8,5,5,5,6,6,6,8,8,8,8,5`); every chunk in the corpus converges at the rANS layer. Block rebuild not implemented yet |
 
 ### Verified numbers (this decoder)
@@ -57,15 +57,17 @@ None of the branches contain game files or decoded textures. Scripts read textur
 
 ## Usage
 
-CLI (BC1):
+CLI:
 
 ```bash
 cargo build --release
 bcpack decode-bc1 chunk.bin 4096 out.bc1        # chunk bytes (zero pad allowed) + block count
-bcpack symbols chunk.bin 4096                   # the 12 lane symbol streams
+bcpack decode-bc5 chunk.bin 4096 out.bc5        # decode-bc3, decode-bc4 and decode-bc7 work likewise
+bcpack symbols --format bc5 chunk.bin 4096      # one line per lane (default format: bc1)
 bcpack ttpf-export pool.ttpf 318 out.png        # mip 0 of a BC1 texture, decoded + detiled (.png or .dds)
 bcpack scan --jobs 8 --every 10 pools/*.ttpf    # convergence and speed over stores
-bcpack bench chunk.bin 4096                     # single-core speed (CPU time)
+bcpack ttpf-export pool.ttpf 318 out.dds        # mip 0 in BC1, BC3, BC4, BC5 or BC7
+bcpack bench --format bc7 chunk.bin 4096        # single-core speed (default format: bc1)
 ```
 
 `--window file.json` and `--quads file.json` replace the built-in BC1 tables, so a newer fit can be tried without rebuilding. `tools/import_tables.py` converts fit outputs into the `data/` format.
@@ -93,7 +95,7 @@ To embed only the decoder, turn off the default features. The library then depen
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", default-features = false }
 ```
 
-Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`, BC1 only). `cli` (default) adds the `bcpack` tool on top (`rayon`).
+Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`; PNG for BC1). `cli` (default) adds the `bcpack` tool on top (`rayon`).
 
 Python reference (BC1, slow, readable): `python3 -I python/bcpack.py decode-bc1 chunk.bin 4096 out.bc1`.
 
@@ -105,7 +107,7 @@ Python reference (BC1, slow, readable): `python3 -I python/bcpack.py decode-bc1 
 - `src/bcn.rs`: lane symbols to BC3, BC4 and BC5 blocks (pair ranks, BC3 quadrant ranks, 255-entry dictionaries)
 - `src/bc7.rs`: lane symbols to BC7 blocks (control codes, 255-entry dictionary, BC7 block pack/unpack)
 - `src/ttpf.rs`: RDS5 stores, ETPF texture index, Gfx10 mip layout and detiling, BC1 to RGBA, DDS/PNG
-- `src/encode.rs`: synthetic BC1 encoder for tests (reverse rANS per fragment, interleaved by replaying the feeder)
+- `src/encode.rs`: synthetic stream encoder for tests (reverse rANS per fragment, interleaved by replaying the feeder)
 - `src/tables.rs`, `python/bcpack_tables.py`: generated from `mdu_minirans.v` by `tools/gen_tables.py`
 - `data/`: built-in constant tables (`bc1_window.json`, `bc1_quad_table.json`, `bc3.json`, `bc4.json`, `bc5.json`, `bc7.json`)
 - `python/bcpack.py`: BC1 reference decoder, pure Python

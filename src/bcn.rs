@@ -175,8 +175,8 @@ impl PairTable {
                 .as_array()
                 .filter(|p| p.len() == 2)
                 .ok_or_else(|| format!("{what}: symbol {s} is not a pair"))?;
-            for k in 0..2 {
-                let x = p[k].as_u64().filter(|&x| x < 8);
+            for (k, value) in p.iter().enumerate() {
+                let x = value.as_u64().filter(|&x| x < 8);
                 t.pairs[s][k] = x.ok_or_else(|| format!("{what}: symbol {s} out of range"))? as u8;
             }
             t.known[s] = true;
@@ -226,8 +226,8 @@ impl QuadTable {
                 .as_array()
                 .filter(|p| p.len() == 4)
                 .ok_or_else(|| format!("{what}: symbol {s} is not a quad"))?;
-            for k in 0..4 {
-                let x = p[k].as_u64().filter(|&x| x < 4);
+            for (k, value) in p.iter().enumerate() {
+                let x = value.as_u64().filter(|&x| x < 4);
                 t.quads[s][k] = x.ok_or_else(|| format!("{what}: symbol {s} out of range"))? as u8;
             }
             t.known[s] = true;
@@ -544,8 +544,8 @@ pub fn assemble(lanes: &LaneOutput, t: &Tables) -> Rebuilt {
     let (mut unfitted, mut dict_refs) = (0usize, 0usize);
     let (ne, ni) = (layout.endpoints(), layout.indices());
     let mut ep_mask = [0u8; 8];
-    for k in 0..ne {
-        ep_mask[k] = ((1u16 << layout.ep_bits[k]) - 1) as u8;
+    for (k, mask) in ep_mask.iter_mut().take(ne).enumerate() {
+        *mask = ((1u16 << layout.ep_bits[k]) - 1) as u8;
     }
     for i in 0..n {
         let mut unk = Unknown::default();
@@ -554,8 +554,8 @@ pub fn assemble(lanes: &LaneOutput, t: &Tables) -> Rebuilt {
         dict_refs += matches!(es, Source::Dictionary(_)) as usize
             + matches!(xs, Source::Dictionary(_)) as usize;
         let (e, eu) = hist.get(t, es, &zero);
-        for k in 0..ne {
-            st.ep[k] = st.ep[k].wrapping_add(e.ep[k]) & ep_mask[k];
+        for (k, &mask) in ep_mask.iter().take(ne).enumerate() {
+            st.ep[k] = st.ep[k].wrapping_add(e.ep[k]) & mask;
         }
         unk.ep |= eu.ep;
         let (x, xu) = hist.get(t, xs, &zero);

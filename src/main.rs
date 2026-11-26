@@ -4,29 +4,30 @@
 // If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 //! `bcpack` command line tool.
 
-use bcpack::{bc1, rans, ttpf};
+use bcpack::{bc1, decode_chunk, format::Mode, rans, ttpf};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-const USAGE: &str = "bcpack: decoder for Xbox Series BCPack BC1 texture streams
+const USAGE: &str = "bcpack: decoder for Xbox Series BCPack texture streams
 
 Usage:
-  bcpack decode-bc1 <chunk.bin> <blocks> <out.bc1>
-      Decode one BCPack BC1 chunk (trailing zero padding allowed) to BC1 blocks
+  bcpack decode-{bc1|bc3|bc4|bc5|bc7} <chunk.bin> <blocks> <out.blocks>
+      Decode one BCPack chunk (trailing zero padding allowed) to BC blocks
       in stream order (= stored Gfx10 tile order).
-  bcpack symbols <chunk.bin> <blocks>
-      Print the 12 decoded lane symbol streams, one line per lane.
+  bcpack symbols [--format FORMAT] <chunk.bin> <blocks>
+      Print the decoded lane symbol streams, one line per lane.
   bcpack ttpf-export <store.ttpf> <texture_index> <out.dds|out.png>
-      Decode, detile and write mip 0 of a BC1 texture.
+      Decode and detile mip 0 to DDS (all five formats) or PNG (BC1).
   bcpack scan [--jobs N] [--every K] [--max-blocks N] [--emit DIR] <store.ttpf>...
       Decode every K-th BC1 chunk and report convergence and speed.
-  bcpack bench <chunk.bin> <blocks> [seconds]
+  bcpack bench [--format FORMAT] <chunk.bin> <blocks> [seconds]
       Single-thread decode speed on one chunk.
+  FORMAT is bc1 (default), bc3, bc4, bc5 or bc7.
 
-Options for all decoding commands:
+BC1 table options:
   --window <file.json>   preset endpoint window (default: built-in data/bc1_window.json)
   --quads <file.json>    index codebook (default: built-in data/bc1_quad_table.json)
 ";
@@ -38,6 +39,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 struct Opts {
     pos: Vec<String>,
+    format: Mode,
     window: bc1::Window,
     quads: bc1::QuadTable,
     jobs: usize,
@@ -46,9 +48,10 @@ struct Opts {
     emit: Option<PathBuf>,
 }
 
-fn parse(args: &[String]) -> Opts {
+fn parse(command: &str, args: &[String]) -> Opts {
     let mut o = Opts {
         pos: vec![],
+        format: Mode::Bc1,
         window: bc1::Window::default_table(),
         quads: bc1::QuadTable::default_table(),
         jobs: 6,
@@ -64,6 +67,13 @@ fn parse(args: &[String]) -> Opts {
     };
     while i < args.len() {
         match args[i].as_str() {
+            "--format" => {
+                if !matches!(command, "symbols" | "bench") {
+                    die("--format applies to symbols and bench");
+                }
+                o.format = supported_mode(&val(i));
+                i += 2;
+            }
             "--window" => {
                 let t = std::fs::read_to_string(val(i)).unwrap_or_else(|e| die(e));
                 o.window = bc1::Window::from_json(&t).unwrap_or_else(|e| die(e));
@@ -106,15 +116,21 @@ fn read(path: &str) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| die(format!("{path}: {e}")))
 }
 
+fn supported_mode(name: &str) -> Mode {
+    Mode::from_name(name)
+        .filter(|m| *m != Mode::Bc6h)
+        .unwrap_or_else(|| die(format!("unsupported block format {name}")))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print!("{USAGE}");
         process::exit(if args.is_empty() { 2 } else { 0 });
     }
-    let o = parse(&args[1..]);
+    let o = parse(&args[0], &args[1..]);
     match args[0].as_str() {
-        "decode-bc1" => cmd_decode(&o),
+        c if c.starts_with("decode-") => cmd_decode(&o, supported_mode(&c[7..])),
         "symbols" => cmd_symbols(&o),
         "ttpf-export" => cmd_export(&o),
         "scan" => cmd_scan(&o),
@@ -124,9 +140,12 @@ fn main() {
 }
 
 /// `<chunk> <blocks> <out>`; the older `<chunk> <out> <blocks>` order is accepted too.
-fn cmd_decode(o: &Opts) {
+fn cmd_decode(o: &Opts, mode: Mode) {
     if o.pos.len() != 3 {
-        die("usage: bcpack decode-bc1 <chunk.bin> <blocks> <out.bc1>");
+        die(format!(
+            "usage: bcpack decode-{} <chunk.bin> <blocks> <out.blocks>",
+            mode.name()
+        ));
     }
     let (blocks, out) = match o.pos[1].parse::<usize>() {
         Ok(b) => (b, &o.pos[2]),
@@ -138,11 +157,11 @@ fn cmd_decode(o: &Opts) {
         ),
     };
     let data = read(&o.pos[0]);
-    let r = bc1::decode(&data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
+    let r = decode_chunk(mode, &data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     std::fs::write(out, &r.blocks).unwrap_or_else(|e| die(e));
     eprintln!(
-        "decoded {blocks} blocks; {} references before block 0, {} blocks depend on unfitted window slots",
-        r.prestart_refs, r.unfitted_blocks
+        "decoded {blocks} blocks; {} references before block 0, {} blocks depend on unfitted table entries",
+        r.dictionary_refs, r.unfitted_blocks
     );
 }
 
@@ -154,14 +173,17 @@ fn cmd_symbols(o: &Opts) {
     let blocks = o.pos[1]
         .parse()
         .unwrap_or_else(|_| die("blocks must be a number"));
-    let r = bc1::decode_symbols(&data, blocks).unwrap_or_else(|e| die(e));
+    let r = o
+        .format
+        .decode_symbols(&data, blocks)
+        .unwrap_or_else(|e| die(e));
     eprintln!(
         "consumed {} of {} bytes in {} cycles",
         r.consumed,
         data.len(),
         r.cycles
     );
-    for l in 0..12 {
+    for l in 0..r.lanes {
         let s: Vec<String> = r.lane(l).iter().map(|v| v.to_string()).collect();
         println!("{}", s.join(" "));
     }
@@ -179,17 +201,21 @@ fn cmd_export(o: &Opts) {
     let tex = texs
         .get(ti)
         .unwrap_or_else(|| die(format!("store has {} textures", texs.len())));
-    let m = bcpack::texture_mip0(&store, tex, &o.window, &o.quads).unwrap_or_else(|e| die(e));
     let out = &o.pos[2];
-    let bytes = if out.to_ascii_lowercase().ends_with(".png") {
+    let png = out.to_ascii_lowercase().ends_with(".png");
+    if png && !bcpack::BC1_DXGI.contains(&tex.dxgi) {
+        die("PNG export requires BC1; use .dds for other supported formats");
+    }
+    let m = bcpack::texture_mip0(&store, tex, &o.window, &o.quads).unwrap_or_else(|e| die(e));
+    let bytes = if png {
         let rgba = ttpf::bc1_to_rgba(&m.blocks, m.bw, m.bh, m.width as usize, m.height as usize);
         ttpf::png_rgba(&rgba, m.width, m.height).unwrap_or_else(|e| die(e))
     } else {
-        ttpf::dds_bc1(&m.blocks, m.width, m.height)
+        ttpf::dds(&m.blocks, m.width, m.height, tex.dxgi).unwrap_or_else(|e| die(e))
     };
     std::fs::write(out, bytes).unwrap_or_else(|e| die(e));
     eprintln!(
-        "texture {ti}: {}x{}, {} BCPack chunk(s), {} blocks depend on unfitted window slots",
+        "texture {ti}: {}x{}, {} BCPack chunk(s), {} blocks depend on unfitted table entries",
         m.width, m.height, m.bcpack_chunks, m.unfitted_blocks
     );
 }
@@ -410,28 +436,27 @@ fn cmd_bench(o: &Opts) {
         }
         None => 2.0,
     };
-    let _ = bc1::decode(&data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
+    let decode =
+        || decode_chunk(o.format, &data, blocks, &o.window, &o.quads).unwrap_or_else(|e| die(e));
+    let warmup = decode();
+    let (consumed, cycles) = (warmup.consumed, warmup.cycles);
+    drop(warmup);
     let t0 = Instant::now();
     let c0 = thread_cpu_secs();
     let mut n = 0u64;
-    let mut consumed = 0usize;
-    let mut cycles = 0u64;
     while n == 0 || t0.elapsed().as_secs_f64() < secs {
-        let lanes = bc1::decode_symbols(&data, blocks).unwrap();
-        consumed = lanes.consumed;
-        cycles = lanes.cycles;
-        let out = bc1::assemble(&lanes, &o.window, &o.quads);
-        std::hint::black_box(&out);
+        std::hint::black_box(decode());
         n += 1;
     }
     let wall = t0.elapsed().as_secs_f64();
     let cpu = c0.and_then(|start| thread_cpu_secs().map(|end| end - start));
     let s = cpu.filter(|&d| d > 0.0).unwrap_or(wall).max(1e-9);
     println!(
-        "{n} decodes, {s:.2} s CPU ({wall:.2} s wall): {:.1} MB/s compressed in, {:.1} MB/s BC1 out, \
+        "{n} decodes, {s:.2} s CPU ({wall:.2} s wall): {:.1} MB/s compressed in, {:.1} MB/s {} out, \
          {:.2} Mblocks/s per core; {:.2} clocks per block",
         (n as f64 * consumed as f64) / s / 1e6,
-        (n as f64 * blocks as f64 * 8.0) / s / 1e6,
+        (n as f64 * blocks as f64 * o.format.block_bytes() as f64) / s / 1e6,
+        o.format.name().to_ascii_uppercase(),
         (n as f64 * blocks as f64) / s / 1e6,
         cycles as f64 / blocks as f64
     );

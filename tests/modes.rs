@@ -254,3 +254,159 @@ fn bc7_dictionary_multiset_not_unfitted() {
     let out_partial = bc7::assemble(&l, &partial);
     assert_eq!(out_partial.unfitted_blocks, 1);
 }
+
+#[test]
+fn synthetic_streams_round_trip() {
+    let window = bcpack::bc1::Window::default_table();
+    let quads = bcpack::bc1::QuadTable::default_table();
+    for mode in [Mode::Bc3, Mode::Bc4, Mode::Bc5, Mode::Bc7] {
+        for (blocks, fragment) in [(1, 1), (67, 5), (517, 900)] {
+            let (mut stream, symbols) = bcpack::encode::synthetic(mode, 7, blocks, fragment);
+            let consumed = stream.len();
+            stream.extend_from_slice(&[0; 13]);
+            let mut expected = lanes(
+                mode.alphabet_bits().len(),
+                blocks * mode.symbols_per_block(),
+            );
+            expected.symbols = symbols.concat();
+            let decoded = mode.decode_symbols(&stream, blocks).unwrap();
+            assert_eq!(decoded.symbols, expected.symbols);
+            assert_eq!(decoded.consumed, consumed);
+            let reference = if mode == Mode::Bc7 {
+                let r = bc7::assemble(&expected, bc7::Tables::default_table());
+                assert_eq!(r.unknown_controls, 0);
+                r.blocks
+            } else {
+                bcn::assemble(&expected, Tables::default_for(mode).unwrap()).blocks
+            };
+            let rebuilt = bcpack::decode_chunk(mode, &stream, blocks, &window, &quads).unwrap();
+            assert_eq!(rebuilt.blocks, reference);
+            assert_eq!(rebuilt.blocks.len(), blocks * mode.block_bytes());
+            assert_eq!(rebuilt.unfitted_blocks, 0);
+            stream.push(1);
+            assert!(mode.decode_symbols(&stream, blocks).is_err());
+        }
+    }
+}
+
+#[cfg(feature = "ttpf")]
+#[test]
+fn compressed_mip_tail_to_dx10_dds() {
+    use bcpack::ttpf::{self, Chunk, Store, Texture};
+    let window = bcpack::bc1::Window::default_table();
+    let quads = bcpack::bc1::QuadTable::default_table();
+    for (mode, dxgi) in [
+        (Mode::Bc3, 78),
+        (Mode::Bc4, 81),
+        (Mode::Bc5, 84),
+        (Mode::Bc7, 99),
+    ] {
+        for tile_mode in [0, 1] {
+            let tile = if tile_mode == 0 { 65536 } else { 4096 };
+            let stride = mode.block_bytes();
+            let (stream, _) = bcpack::encode::synthetic(mode, 17, tile / stride, 128);
+            let raw = bcpack::decode_chunk(mode, &stream, tile / stride, &window, &quads)
+                .unwrap()
+                .blocks;
+            let chunk = Chunk {
+                index: 0,
+                file_off: 0,
+                file_len: stream.len() as u64,
+                pad: 0,
+                vstart: 0,
+                vlen: tile as u64,
+                codec: mode.codec(),
+            };
+            let store = Store {
+                data: stream,
+                vsize: tile as u64,
+                chunks: vec![chunk],
+                etpf_off: 0,
+            };
+            let tex = Texture {
+                index: 0,
+                hash: 0,
+                width: 5,
+                height: 7,
+                mips: 2,
+                dxgi,
+                array_size: 1,
+                tile_mode,
+                vstart: 0,
+            };
+            let mip = bcpack::texture_mip0(&store, &tex, &window, &quads).unwrap();
+            assert_eq!(
+                (mip.width, mip.height, mip.bw, mip.bh, mip.bcpack_chunks),
+                (5, 7, 2, 2, 1)
+            );
+            // The first tail level starts halfway through the tile. Low address bits
+            // are y0,y1,x0,x1 for 4 KiB/16 B and x0,y0 for the other tested layouts.
+            let indices = if tile_mode == 1 && stride == 16 {
+                [0, 4, 1, 5]
+            } else {
+                [0, 1, 2, 3]
+            };
+            let mut expected = Vec::new();
+            for index in indices {
+                let offset = tile / 2 + index * stride;
+                expected.extend_from_slice(&raw[offset..offset + stride]);
+            }
+            assert_eq!(mip.blocks, expected);
+            let dds = ttpf::dds(&mip.blocks, mip.width, mip.height, dxgi).unwrap();
+            let word = |i| u32::from_le_bytes(dds[i..i + 4].try_into().unwrap());
+            assert_eq!((word(12), word(16), word(20)), (7, 5, 4 * stride as u32));
+            assert_eq!(&dds[84..88], b"DX10");
+            assert_eq!(
+                [word(128), word(132), word(136), word(140), word(144)],
+                [dxgi, 3, 0, 1, 0]
+            );
+            assert_eq!(dds[148..], expected);
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+#[test]
+fn cli_decodes_prints_and_benchmarks_each_format() {
+    use std::{fs, process::Command};
+    let dir = std::env::temp_dir().join(format!("bcpack-cli-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bcpack"))
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    for mode in [Mode::Bc3, Mode::Bc4, Mode::Bc5, Mode::Bc7] {
+        let name = mode.name();
+        let (stream, syms) = bcpack::encode::synthetic(mode, 19, 3, 4);
+        fs::write(dir.join("chunk"), &stream).unwrap();
+        run(&[&format!("decode-{name}"), "chunk", "3", "blocks"]);
+        let w = bcpack::bc1::Window::default_table();
+        let q = bcpack::bc1::QuadTable::default_table();
+        let expected = bcpack::decode_chunk(mode, &stream, 3, &w, &q).unwrap();
+        assert_eq!(fs::read(dir.join("blocks")).unwrap(), expected.blocks);
+        let printed = run(&["symbols", "--format", name, "chunk", "3"]);
+        let lanes: Vec<Vec<u16>> = printed
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(lanes, syms);
+        assert!(run(&["bench", "--format", name, "chunk", "3", "0.001"])
+            .contains(&format!("MB/s {} out", name.to_ascii_uppercase())));
+    }
+    fs::remove_file(dir.join("chunk")).unwrap();
+    fs::remove_file(dir.join("blocks")).unwrap();
+    fs::remove_dir(dir).unwrap();
+}

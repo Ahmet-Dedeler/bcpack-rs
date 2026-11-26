@@ -25,8 +25,8 @@
 //! * [`format`]: mode metadata, lane widths, back-references and dictionary addressing;
 //! * [`bcn`]: lane symbols -> BC3, BC4 and BC5 blocks;
 //! * [`bc7`]: lane symbols -> BC7 blocks (plus block pack/unpack);
-//! * [`ttpf`]: RDS5 texture stores, Gfx10 detiling, DDS/PNG output (BC1);
-//! * [`encode`]: a synthetic encoder used by the tests (BC1);
+//! * [`ttpf`]: RDS5 texture stores, Gfx10 detiling, DDS output and BC1 PNG output;
+//! * [`encode`]: a synthetic encoder used by the tests;
 //! * [`tables`]: the exact model tables, generated from Microsoft's
 //!   MIT-licensed `silicon-rans` Verilog.
 //!
@@ -47,3 +47,57 @@ pub mod ttpf;
 mod texture;
 #[cfg(feature = "ttpf")]
 pub use texture::*;
+
+/// A decoded chunk in stored block order, including entropy and rebuild diagnostics.
+pub struct DecodedChunk {
+    pub blocks: Vec<u8>,
+    pub dictionary_refs: usize,
+    pub unfitted_blocks: usize,
+    pub consumed: usize,
+    pub cycles: u64,
+}
+
+/// Decode one chunk using its block count. The supplied window and quads apply to BC1.
+pub fn decode_chunk(
+    mode: format::Mode,
+    chunk: &[u8],
+    blocks: usize,
+    window: &bc1::Window,
+    quads: &bc1::QuadTable,
+) -> Result<DecodedChunk, rans::DecodeError> {
+    use format::Mode;
+    if mode == Mode::Bc6h {
+        return Err(rans::DecodeError::Invalid(
+            "BC6H block rebuild is unsupported".into(),
+        ));
+    }
+    let lanes = mode.decode_symbols(chunk, blocks)?;
+    let (blocks, dictionary_refs, unfitted_blocks) = match mode {
+        Mode::Bc1 => {
+            let r = bc1::assemble(&lanes, window, quads);
+            (r.blocks, r.prestart_refs, r.unfitted_blocks)
+        }
+        Mode::Bc7 => {
+            let r = bc7::assemble(&lanes, bc7::Tables::default_table());
+            if r.unknown_controls != 0 {
+                return Err(rans::DecodeError::Invalid(format!(
+                    "{} unknown BC7 controls",
+                    r.unknown_controls
+                )));
+            }
+            (r.blocks, r.dictionary_refs, r.unfitted_blocks)
+        }
+        mode => {
+            let tables = bcn::Tables::default_for(mode).expect("BC3/BC4/BC5 tables");
+            let r = bcn::assemble(&lanes, tables);
+            (r.blocks, r.dictionary_refs, r.unfitted_blocks)
+        }
+    };
+    Ok(DecodedChunk {
+        blocks,
+        dictionary_refs,
+        unfitted_blocks,
+        consumed: lanes.consumed,
+        cycles: lanes.cycles,
+    })
+}
