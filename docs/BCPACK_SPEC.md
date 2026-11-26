@@ -39,8 +39,8 @@ A BC1 chunk is one byte stream shared by **12 lanes**. Each lane is an independe
 
 | Lane | Symbol width | Verilog `alphabet_bits` | Content |
 |---|---|---|---|
-| 0 | 8 | 7 | back-reference distance (section 5.1) |
-| 1 | 8 | 7 | unused; always 0 in retail data |
+| 0 | 8 | 7 | endpoint delta, added to the index reference (section 5.1) |
+| 1 | 8 | 7 | index reference `x` (blocks back, 0 = none); 0 in every retail chunk measured so far, but the format allows it (see below) |
 | 2-7 | 5, 6, 5, 5, 6, 5 | 4, 5, 4, 4, 5, 4 | residuals of R0 G0 B0 R1 G1 B1 (section 5.2) |
 | 8-11 | 8 | 7 | index codebook symbols for the 2x2 quadrants TL, TR, BL, BR (section 5.4) |
 
@@ -104,6 +104,8 @@ d = (v >> 1)          if v is even        # 0, 1, 2, ... 127
 ```
 
 i.e. `d = unzigzag(v) mod 256`. d = 0 means "no reference" (predict zero). Otherwise the prediction P is the six endpoint fields of block `i - d`.
+
+That is the case lane 1 = 0. In general (the same rule as the BC3, BC4 and BC5 lanes, [`format::references`]): lane 1 is the **index reference** `x`, and the endpoint reference is `d = (x + unzigzag(lane 0)) mod 256`. Each pixel's index residual (section 5.4) is added along the endpoint line (codes 0, 2, 3, 1 = positions 0, 1, 2, 3), modulo 4, to the same pixel of block `i - x`. An index reference before block 0 has no known table yet: it reads zero and the block counts as unfitted. Lane 1 was 0 in every retail chunk measured, so this changes no retail output; it matters for streams that use it, such as other encoders' output. Reported in issue #10 with a two-block case, which is now `tests/roundtrip.rs::bc1_lane1_index_reference`.
 
 ### 5.2 Lanes 2-7: endpoint residuals
 

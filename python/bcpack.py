@@ -346,18 +346,23 @@ def unzigzag(v):
     return -((v + 1) >> 1) if v & 1 else v >> 1
 
 
+def references(d, x):
+    """Lane 0 (signed delta) and lane 1 (index reference) -> (endpoint, index) references."""
+    return (x + unzigzag(d)) & 255, x
+
+
 def endpoints(syms, window, fitted=None):
-    """Lanes 0, 2-7 -> list of (R0, G0, B0, R1, G1, B1) per block, plus the number of
+    """Lanes 0-7 -> list of (R0, G0, B0, R1, G1, B1) per block, plus the number of
     blocks whose reference chain reaches an unfitted window slot."""
     n = len(syms[0])
-    l0 = syms[0]
+    l0, l1 = syms[0], syms[1]
     res = [syms[2 + k] for k in range(6)]
     mods = [1 << w for w in BC1_ENDPOINT_WIDTHS]
     E = [None] * n
     tainted = [False] * n
     zero = (0, 0, 0, 0, 0, 0)
     for i in range(n):
-        d = back_distance(l0[i])
+        d, _ = references(l0[i] & 255, l1[i] & 255)
         t = False
         if d == 0:
             P = zero
@@ -392,14 +397,34 @@ def quad_masks(table):
     return out
 
 
+CODE_TO_LINE = (0, 3, 1, 2)   # BC1 codes 0, 2, 3, 1 sit at line positions 0, 1, 2, 3
+LINE_TO_CODE = (0, 2, 3, 1)
+
+
+def add_index_reference(word, ref_lines):
+    """Residual index word + the reference block's line positions -> (word, lines)."""
+    lines = 0
+    for p in range(16):
+        v = (CODE_TO_LINE[(word >> (2 * p)) & 3] + ((ref_lines >> (2 * p)) & 3)) & 3
+        lines |= v << (2 * p)
+    word = 0
+    for p in range(16):
+        word |= LINE_TO_CODE[(lines >> (2 * p)) & 3] << (2 * p)
+    return word, lines
+
+
 def assemble_bc1(syms, window, table, fitted=None):
     E, tainted = endpoints(syms, window, fitted)
     masks = quad_masks(table)
     out = bytearray()
+    lines = [0] * len(E)
     for i, e in enumerate(E):
         c0 = (e[0] << 11) | (e[1] << 5) | e[2]
         c1 = (e[3] << 11) | (e[4] << 5) | e[5]
         idx = masks[0][syms[8][i]] | masks[1][syms[9][i]] | masks[2][syms[10][i]] | masks[3][syms[11][i]]
+        x = syms[1][i] & 255
+        ref = lines[i - x] if 0 < x <= i else 0   # before block 0: no known table, read zero
+        idx, lines[i] = add_index_reference(idx, ref)
         out += struct.pack("<HHI", c0, c1, idx)
     return bytes(out), tainted
 
