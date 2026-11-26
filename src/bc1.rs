@@ -8,16 +8,22 @@
 //!
 //! | lane | width | meaning |
 //! |---|---|---|
-//! | 0 | 8 | back-reference distance `d = unzigzag(v) mod 256` (0 = none) |
-//! | 1 | 8 | unused (always 0 in retail data) |
+//! | 0 | 8 | endpoint delta `unzigzag(v)`, added to the index reference |
+//! | 1 | 8 | index reference `x` (blocks back, 0 = none; 0 in the retail data measured so far) |
 //! | 2-7 | 5,6,5,5,6,5 | zigzag residuals of R0 G0 B0 R1 G1 B1 |
 //! | 8-11 | 8 | 2x2 index quadrants TL, TR, BL, BR (codebook symbols) |
 //!
+//! The two references are those of [`crate::format::references`]: the index
+//! reference is `x` blocks back and the endpoint reference is
+//! `d = (x + unzigzag(lane 0)) mod 256` blocks back (0 = the zero state).
 //! Endpoint fields of block i = fields of block `i - d` (or zero when d = 0)
-//! plus the residual, modulo 2^width. A reference before block 0 reads slot
-//! `(i - d) mod 256` of a fixed preset window ([`Window`]). The index word is
-//! assembled from the four quadrant patterns of a fixed codebook
-//! ([`QuadTable`]). Blocks come out in stream order, which is the stored Gfx10
+//! plus the residual, modulo 2^width. An endpoint reference before block 0
+//! reads slot `(i - d) mod 256` of a fixed preset window ([`Window`]). The
+//! index residuals come from the four quadrant patterns of a fixed codebook
+//! ([`QuadTable`]); each pixel's residual is added, along the endpoint line
+//! and modulo 4, to the same pixel of block `i - x`. An index reference
+//! before block 0 has no known table here: it reads zero and the block is
+//! counted in [`Bc1Output::unfitted_blocks`]. Blocks come out in stream order, which is the stored Gfx10
 //! tile order of the texture.
 
 use crate::rans::{self, DecodeError, LaneOutput};
@@ -190,6 +196,7 @@ pub struct Bc1Output {
 pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Output {
     let n = lanes.target;
     let l0 = lanes.lane(0);
+    let l1 = lanes.lane(1);
     let res: [&[u16]; 6] = [
         lanes.lane(2),
         lanes.lane(3),
@@ -205,8 +212,9 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
     let mut out = vec![0u8; n * 8];
     let mut unfitted = 0usize;
     let mut prestart = 0usize;
+    let mut lines = [0u32; 256];
     for i in 0..n {
-        let d = back_distance(l0[i]);
+        let (d, x) = crate::format::references(l0[i] as u8, l1[i] as u8);
         let (pred, t) = if d == 0 {
             ([0u8; 6], false)
         } else if d <= i {
@@ -226,10 +234,24 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
         unfitted += t as usize;
         let c0 = (e[0] as u16) << 11 | (e[1] as u16) << 5 | e[2] as u16;
         let c1 = (e[3] as u16) << 11 | (e[4] as u16) << 5 | e[5] as u16;
-        let w = quads.masks[0][idx[0][i] as usize & 0xFF]
+        let residual = quads.masks[0][idx[0][i] as usize & 0xFF]
             | quads.masks[1][idx[1][i] as usize & 0xFF]
             | quads.masks[2][idx[2][i] as usize & 0xFF]
             | quads.masks[3][idx[3][i] as usize & 0xFF];
+        let (ref_line, ref_t) = if x == 0 {
+            (0, false)
+        } else if x <= i {
+            (lines[(i - x) & 255], tainted[(i - x) & 255])
+        } else {
+            (0, true)
+        };
+        let line = add_lines(codes_to_lines(residual), ref_line);
+        lines[i & 255] = line;
+        if ref_t && !t {
+            tainted[i & 255] = true;
+            unfitted += 1;
+        }
+        let w = lines_to_codes(line);
         let o = &mut out[i * 8..i * 8 + 8];
         o[0..2].copy_from_slice(&c0.to_le_bytes());
         o[2..4].copy_from_slice(&c1.to_le_bytes());
@@ -240,6 +262,29 @@ pub fn assemble(lanes: &LaneOutput, window: &Window, quads: &QuadTable) -> Bc1Ou
         unfitted_blocks: unfitted,
         prestart_refs: prestart,
     }
+}
+
+/// Position of each BC1 code along the endpoint line (c0, 1/3, 2/3, c1):
+/// codes 0, 2, 3, 1 are line positions 0, 1, 2, 3.
+const CODE_TO_LINE: [u32; 4] = [0, 3, 1, 2];
+const LINE_TO_CODE: [u32; 4] = [0, 2, 3, 1];
+
+/// A BC1 index word (16 2-bit codes) -> the same pixels as line positions.
+#[inline]
+fn codes_to_lines(w: u32) -> u32 {
+    (0..16).fold(0, |acc, p| acc | CODE_TO_LINE[(w >> (2 * p) & 3) as usize] << (2 * p))
+}
+
+/// Line positions -> a BC1 index word.
+#[inline]
+fn lines_to_codes(l: u32) -> u32 {
+    (0..16).fold(0, |acc, p| acc | LINE_TO_CODE[(l >> (2 * p) & 3) as usize] << (2 * p))
+}
+
+/// Per-pixel sum of two line-position words, modulo 4.
+#[inline]
+fn add_lines(a: u32, b: u32) -> u32 {
+    (0..16).fold(0, |acc, p| acc | (((a >> (2 * p)) + (b >> (2 * p))) & 3) << (2 * p))
 }
 
 /// Decode the 12 lane symbol streams of a BCPack BC1 chunk.

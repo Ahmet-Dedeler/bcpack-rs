@@ -338,3 +338,35 @@ fn ttpf_codec_mask_high_file_offset_and_mip_bounds() {
     assert!(bcpack::ttpf::mip_chain_bc1(0, 64, 0, 1).is_none());
     assert!(bcpack::ttpf::mip_chain_bc1(0, 64, 64, 33).is_none());
 }
+
+/// BC1 lane 1 is the index reference and the endpoint reference is that
+/// plus lane 0's signed delta (issue #10, tyr0nsur's two-block case).
+#[test]
+fn bc1_lane1_index_reference() {
+    use bcpack::{bc1, encode};
+    let run = |reference: u16| {
+        let lanes: Vec<_> = (0..12)
+            .map(|i| {
+                vec![encode::Fragment {
+                    symbols: vec![
+                        if i >= 2 { 2 + i as u16 % 4 } else { 0 },
+                        if i == 1 { reference } else { 0 },
+                    ],
+                    q: 7,
+                    z: 0,
+                }]
+            })
+            .collect();
+        let stream = encode::encode_lanes(&bc1::BC1_ALPHABET_BITS, &lanes).unwrap();
+        bc1::decode(&stream, 2, &bc1::Window::default_table(), &bc1::QuadTable::default_table())
+            .unwrap()
+            .blocks
+    };
+    let first = [0xa1, 0x17, 0x5d, 0xf0, 0x50, 0x50, 0xfa, 0xaf];
+    let a = run(0);
+    assert_eq!(&a[..8], &first);
+    assert_eq!(&a[8..], &[0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa]);
+    let b = run(1);
+    assert_eq!(&b[..8], &first);
+    assert_eq!(&b[8..], &[0xa1, 0x17, 0x5d, 0xf0, 0x0a, 0x0a, 0x5f, 0xf5]);
+}
