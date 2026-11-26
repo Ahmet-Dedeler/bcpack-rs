@@ -4,12 +4,12 @@
 // If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
 //! Whole-texture decode from an RDS5 store (feature `ttpf`).
 
-use crate::{bc1, ttpf};
+use crate::{bc1, decode_chunk, ttpf};
 use std::io;
 
-/// Mip 0 of a BC1 texture, decoded and detiled.
+/// Mip 0 of a block-compressed texture, decoded and detiled.
 pub struct Mip0 {
-    /// Row-major BC1 blocks, `bw * bh * 8` bytes.
+    /// Row-major BC blocks in the texture descriptor's DXGI format.
     pub blocks: Vec<u8>,
     pub bw: usize,
     pub bh: usize,
@@ -26,7 +26,7 @@ pub struct Mip0 {
 pub const BC1_DXGI: [u32; 3] = [70, 71, 72];
 
 /// Decode mip 0 of texture `tex` in `store`: plain chunks are inflated, BCPack
-/// BC1 chunks are decoded whole and the covering slice is used.
+/// chunks are decoded whole and the covering slice is used.
 pub fn texture_mip0(
     store: &ttpf::Store,
     tex: &ttpf::Texture,
@@ -34,13 +34,15 @@ pub fn texture_mip0(
     quads: &bc1::QuadTable,
 ) -> io::Result<Mip0> {
     let err = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-    if !BC1_DXGI.contains(&tex.dxgi) || tex.array_size != 1 || tex.tile_mode > 3 {
+    let mode = ttpf::texture_mode(tex.dxgi)
+        .ok_or_else(|| err(format!("unsupported DXGI format {}", tex.dxgi)))?;
+    if tex.array_size != 1 || tex.tile_mode > 3 {
         return Err(err(format!(
-            "texture {}: only single BC1 textures are supported (dxgi {}, array {}, tile mode {})",
+            "texture {}: unsupported texture layout (dxgi {}, array {}, tile mode {})",
             tex.index, tex.dxgi, tex.array_size, tex.tile_mode
         )));
     }
-    let (levels, _) = ttpf::mip_chain_bc1(tex.tile_mode, tex.width, tex.height, tex.mips)
+    let (levels, _) = ttpf::mip_chain(mode, tex.tile_mode, tex.width, tex.height, tex.mips)
         .ok_or_else(|| err("unsupported mip layout".into()))?;
     let p0 = &levels[0];
     let a = tex
@@ -60,20 +62,30 @@ pub fn texture_mip0(
     for (ci, f, e) in spans {
         let c = &store.chunks[ci];
         let bytes = match c.codec {
-            ttpf::CODEC_BC1 => {
+            codec if codec == mode.codec() => {
+                let len = usize::try_from(c.vlen)
+                    .map_err(|_| err(format!("chunk {ci}: length overflow")))?;
+                if len % mode.block_bytes() != 0 {
+                    return Err(err(format!("chunk {ci}: partial {} block", mode.name())));
+                }
                 let raw = store.chunk_bytes(ci, true)?;
-                let out = bc1::decode(raw, (c.vlen / 8) as usize, window, quads)
+                let out = decode_chunk(mode, raw, len / mode.block_bytes(), window, quads)
                     .map_err(|e| err(format!("chunk {ci}: {e}")))?;
                 nbc += 1;
                 unfitted += out.unfitted_blocks;
                 out.blocks
             }
             ttpf::CODEC_ZLIB | ttpf::CODEC_STORED => store.plain_chunk(ci)?,
-            x => return Err(err(format!("chunk {ci}: codec {x:#x} not supported"))),
+            x => {
+                return Err(err(format!(
+                    "chunk {ci}: codec {x:#x} incompatible with DXGI {}",
+                    tex.dxgi
+                )))
+            }
         };
         gfx10.extend_from_slice(&bytes[f as usize..e as usize]);
     }
-    let (blocks, bw, bh) = ttpf::detile_bc1(&gfx10, p0, tex.tile_mode);
+    let (blocks, bw, bh) = ttpf::detile(mode, &gfx10, p0, tex.tile_mode);
     Ok(Mip0 {
         blocks,
         bw,

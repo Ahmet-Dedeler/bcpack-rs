@@ -284,7 +284,7 @@ fn lines_to_codes(l: u32) -> u32 {
 /// Per-pixel sum of two line-position words, modulo 4.
 #[inline]
 fn add_lines(a: u32, b: u32) -> u32 {
-    (0..16).fold(0, |acc, p| acc | (((a >> (2 * p)) + (b >> (2 * p))) & 3) << (2 * p))
+    (0..16).fold(0, |acc, p| acc | ((a >> (2 * p)).wrapping_add(b >> (2 * p)) & 3) << (2 * p))
 }
 
 /// Decode the 12 lane symbol streams of a BCPack BC1 chunk.

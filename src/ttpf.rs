@@ -16,6 +16,7 @@
 //! * codecs: 0x00 stored, 0x20 zlib, 0x04 BC1 BCPack (0x08..0x1C other BCn BCPack);
 //! * ETPF index: `ETPF`, count at +8, then 16-byte descriptors and 8-byte hashes.
 
+use crate::format::Mode;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -247,6 +248,17 @@ pub fn pattern_8b(tile_mode: u32) -> &'static str {
     }
 }
 
+// 16-byte element swizzles from ttpf-viewer's src/tile.rs (bafe9af).
+fn block_pattern(mode: Mode, tile_mode: u32) -> &'static str {
+    if mode.block_bytes() == 8 {
+        pattern_8b(tile_mode)
+    } else if tile_mode == 0 {
+        "xyxyyxyxyxyx"
+    } else {
+        "yyxxyxyx"
+    }
+}
+
 fn tile_lut(pattern: &str) -> (Vec<u32>, Vec<u32>, u32, u32) {
     let n = pattern.len();
     let mut lx = Vec::with_capacity(1 << n);
@@ -308,8 +320,18 @@ pub struct Place {
 
 /// Gfx10 mip chain of an 8-byte-block (BC1) texture: levels largest first.
 pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<Place>, u64)> {
-    let elem: u64 = 8;
-    let pat = pattern_8b(tile_mode);
+    mip_chain(Mode::Bc1, tile_mode, w, h, mips)
+}
+
+pub(crate) fn mip_chain(
+    mode: Mode,
+    tile_mode: u32,
+    w: u32,
+    h: u32,
+    mips: u32,
+) -> Option<(Vec<Place>, u64)> {
+    let elem = mode.block_bytes() as u64;
+    let pat = block_pattern(mode, tile_mode);
     let is64k = tile_mode == 0;
     if w == 0 || h == 0 || mips == 0 || mips > 32 {
         return None;
@@ -329,7 +351,7 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
             }
         }
     }
-    let (mw, mh) = (8u32, 4u32);
+    let (mw, mh) = (64 / elem as u32, 4); // a 256-byte micro block
     let mut levels: Vec<Option<Place>> = vec![None; mips as usize];
     let mut pos: u64 = 0;
     if tail < mips {
@@ -384,20 +406,30 @@ pub fn mip_chain_bc1(tile_mode: u32, w: u32, h: u32, mips: u32) -> Option<(Vec<P
 
 /// Stored (tiled) level bytes -> row-major BC1 blocks of the level, cropped.
 pub fn detile_bc1(data: &[u8], place: &Place, tile_mode: u32) -> (Vec<u8>, usize, usize) {
+    detile(Mode::Bc1, data, place, tile_mode)
+}
+
+pub(crate) fn detile(
+    mode: Mode,
+    data: &[u8],
+    place: &Place,
+    tile_mode: u32,
+) -> (Vec<u8>, usize, usize) {
+    let elem = mode.block_bytes();
     let (pwb, phb) = ((place.pw / 4) as usize, (place.ph / 4) as usize);
-    let n = data.len() / 8;
-    let order = untile_order(n, pwb, phb, pattern_8b(tile_mode));
-    let mut lin = vec![0u8; pwb * phb * 8];
+    let n = data.len() / elem;
+    let order = untile_order(n, pwb, phb, block_pattern(mode, tile_mode));
+    let mut lin = vec![0u8; pwb * phb * elem];
     for (i, d) in order.iter().enumerate() {
         if let Some(d) = d {
-            lin[d * 8..d * 8 + 8].copy_from_slice(&data[i * 8..i * 8 + 8]);
+            lin[d * elem..d * elem + elem].copy_from_slice(&data[i * elem..i * elem + elem]);
         }
     }
     let (bw, bh) = (place.w.div_ceil(4) as usize, place.h.div_ceil(4) as usize);
     let (ox, oy) = ((place.ox / 4) as usize, (place.oy / 4) as usize);
-    let mut out = Vec::with_capacity(bw * bh * 8);
+    let mut out = Vec::with_capacity(bw * bh * elem);
     for y in oy..oy + bh {
-        out.extend_from_slice(&lin[(y * pwb + ox) * 8..(y * pwb + ox + bw) * 8]);
+        out.extend_from_slice(&lin[(y * pwb + ox) * elem..(y * pwb + ox + bw) * elem]);
     }
     (out, bw, bh)
 }
@@ -465,7 +497,33 @@ pub fn bc1_to_rgba(blocks: &[u8], bw: usize, bh: usize, w: usize, h: usize) -> V
 
 /// A DDS file (legacy header, FourCC DXT1) holding one BC1 level.
 pub fn dds_bc1(blocks: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let mut d = Vec::with_capacity(128 + blocks.len());
+    dds_header(blocks, w, h, None)
+}
+
+/// Write mip 0 as DDS. Use the original DXGI type for BC3/4/5/7 and legacy DXT1 for BC1.
+pub fn dds(blocks: &[u8], w: u32, h: u32, dxgi: u32) -> io::Result<Vec<u8>> {
+    let mode = texture_mode(dxgi).ok_or_else(|| bad(format!("unsupported DDS format {dxgi}")))?;
+    Ok(dds_header(
+        blocks,
+        w,
+        h,
+        (mode != Mode::Bc1).then_some(dxgi),
+    ))
+}
+
+pub(crate) fn texture_mode(dxgi: u32) -> Option<Mode> {
+    match dxgi {
+        70..=72 => Some(Mode::Bc1),
+        76..=78 => Some(Mode::Bc3),
+        79..=81 => Some(Mode::Bc4),
+        82..=84 => Some(Mode::Bc5),
+        97..=99 => Some(Mode::Bc7),
+        _ => None,
+    }
+}
+
+fn dds_header(blocks: &[u8], w: u32, h: u32, dxgi: Option<u32>) -> Vec<u8> {
+    let mut d = Vec::with_capacity(148 + blocks.len());
     let mut put = |v: u32| d.extend_from_slice(&v.to_le_bytes());
     put(0x2053_4444); // "DDS "
     put(124); // header size
@@ -480,12 +538,23 @@ pub fn dds_bc1(blocks: &[u8], w: u32, h: u32) -> Vec<u8> {
     }
     put(32); // pixel format size
     put(0x4); // DDPF_FOURCC
-    put(u32::from_le_bytes(*b"DXT1"));
+    put(u32::from_le_bytes(if dxgi.is_some() {
+        *b"DX10"
+    } else {
+        *b"DXT1"
+    }));
     for _ in 0..5 {
         put(0);
     }
     put(0x1000); // DDSCAPS_TEXTURE
     for _ in 0..4 {
+        put(0);
+    }
+    if let Some(format) = dxgi {
+        put(format);
+        put(3); // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+        put(0);
+        put(1); // array size
         put(0);
     }
     d.extend_from_slice(blocks);

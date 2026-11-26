@@ -110,6 +110,18 @@ impl Mode {
         }
     }
 
+    /// Decode the entropy layer of a chunk, given the number of BC blocks.
+    pub fn decode_symbols(
+        self,
+        chunk: &[u8],
+        blocks: usize,
+    ) -> Result<crate::rans::LaneOutput, crate::rans::DecodeError> {
+        let target = blocks
+            .checked_mul(self.symbols_per_block())
+            .ok_or_else(|| crate::rans::DecodeError::Invalid("symbol count overflow".into()))?;
+        crate::rans::decode_slice(chunk, self.alphabet_bits(), target)
+    }
+
     /// Symbols each lane emits per block (one per 8 unpacked bytes).
     pub fn symbols_per_block(self) -> usize {
         self.block_bytes() / 8

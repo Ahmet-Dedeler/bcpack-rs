@@ -16,8 +16,8 @@
 //!    The feeder only looks at lane states, so the recorded order is the order
 //!    a decoder reading one shared stream will request.
 
-use crate::bc1;
 use crate::rans::{self, ByteSource, DecodeError, Model, L};
+use crate::{bc7, format::Mode};
 use std::collections::VecDeque;
 
 /// One fragment of a lane: symbols coded with model `q`, alphabet narrowed by `z`.
@@ -219,15 +219,55 @@ pub fn sample_symbol(rng: &mut Rng, eab: u8, q: u8) -> u16 {
 /// models), split into fragments of at most `max_frag` symbols. Returns the
 /// stream and the symbols per lane.
 pub fn synthetic_bc1(seed: u64, blocks: usize, max_frag: usize) -> (Vec<u8>, Vec<Vec<u16>>) {
+    synthetic(Mode::Bc1, seed, blocks, max_frag)
+}
+
+/// Generate a deterministic stream and its lane symbols for the given mode.
+/// BC7 controls are sampled from the fitted table so every block can be rebuilt.
+pub fn synthetic(
+    mode: Mode,
+    seed: u64,
+    blocks: usize,
+    max_frag: usize,
+) -> (Vec<u8>, Vec<Vec<u16>>) {
     assert!(max_frag > 0, "max_frag must be > 0");
     let mut rng = Rng(seed | 1);
-    let ab = bc1::BC1_ALPHABET_BITS;
+    let ab = mode.alphabet_bits();
+    let target = blocks
+        .checked_mul(mode.symbols_per_block())
+        .expect("symbol count overflow");
     let mut lanes = Vec::new();
     let mut syms = Vec::new();
-    for &a in ab.iter() {
+    for (lane, &a) in ab.iter().enumerate() {
+        if mode == Mode::Bc7 && lane == 15 {
+            let codes: Vec<_> = bc7::Tables::default_table()
+                .control
+                .iter()
+                .enumerate()
+                .filter_map(|(code, c)| c.map(|_| code))
+                .collect();
+            let symbols: Vec<_> = (0..blocks)
+                .flat_map(|_| {
+                    let code = codes[rng.below(codes.len() as u64) as usize];
+                    [(code & 31) as u16, (code >> 5) as u16]
+                })
+                .collect();
+            lanes.push(
+                symbols
+                    .chunks(max_frag)
+                    .map(|s| Fragment {
+                        symbols: s.to_vec(),
+                        q: 7,
+                        z: 0,
+                    })
+                    .collect(),
+            );
+            syms.push(symbols);
+            continue;
+        }
         let mut frags = Vec::new();
         let mut all = Vec::new();
-        let mut left = blocks;
+        let mut left = target;
         while left > 0 {
             let n = left.min(1 + rng.below(max_frag as u64) as usize);
             let z = if rng.below(4) == 0 {
@@ -245,6 +285,6 @@ pub fn synthetic_bc1(seed: u64, blocks: usize, max_frag: usize) -> (Vec<u8>, Vec
         lanes.push(frags);
         syms.push(all);
     }
-    let stream = encode_lanes(&ab, &lanes).expect("synthetic encode");
+    let stream = encode_lanes(ab, &lanes).expect("synthetic encode");
     (stream, syms)
 }
