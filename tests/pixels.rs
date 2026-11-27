@@ -243,8 +243,8 @@ fn bc7_mode6_block_by_hand() {
         ..Default::default()
     };
     st.ep[0] = [0x00, 0xFE, 0x80, 0x00, 0x40, 0xC0, 0xFE, 0x00];
-    for p in 0..16 {
-        st.ix[0][p] = p as u8; // 4-bit indices, top-aligned in 4 bits
+    for (p, ix) in st.ix[0].iter_mut().enumerate().take(16) {
+        *ix = p as u8; // 4-bit indices, top-aligned in 4 bits
     }
     let mut block = [0u8; 16];
     bc7::pack(c, &st, &mut block);
@@ -293,15 +293,15 @@ fn bc7_mode0_three_subsets_by_hand() {
         }
         (v << (8 - base)) as u8
     };
-    for s in 0..3 {
+    for (s, ep) in st.ep.iter_mut().enumerate().take(3) {
         for ch in 0..4 {
             let r = raw(s, ch);
-            st.ep[s][2 * ch] = r;
-            st.ep[s][2 * ch + 1] = r;
+            ep[2 * ch] = r;
+            ep[2 * ch + 1] = r;
         }
     }
-    for p in 0..16 {
-        st.ix[0][p] = 0; // weight 0 -> endpoint 0
+    for ix in st.ix[0].iter_mut().take(16) {
+        *ix = 0; // weight 0 -> endpoint 0
     }
     let mut block = [0u8; 16];
     bc7::pack(c, &st, &mut block);
@@ -371,7 +371,7 @@ fn bc7_flat_endpoints_give_flat_pixels_for_every_control() {
             subsets: subsets as u8,
             ..Default::default()
         };
-        for s in 0..subsets {
+        for ep in st.ep.iter_mut().take(subsets) {
             for (ch, &p) in prec.iter().enumerate() {
                 let v = if p == 0 {
                     0
@@ -379,13 +379,13 @@ fn bc7_flat_endpoints_give_flat_pixels_for_every_control() {
                     rng.below(1u64 << p) as u32
                 };
                 let raw = if p == 0 { 0 } else { (v << (8 - p)) as u8 };
-                st.ep[s][2 * ch] = raw;
-                st.ep[s][2 * ch + 1] = raw;
+                ep[2 * ch] = raw;
+                ep[2 * ch + 1] = raw;
             }
         }
-        for set in 0..2 {
-            for p in 0..16 {
-                st.ix[set][p] = rng.below(16) as u8;
+        for set in st.ix.iter_mut().take(2) {
+            for ix in set.iter_mut().take(16) {
+                *ix = rng.below(16) as u8;
             }
         }
         let mut block = [0u8; 16];
