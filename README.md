@@ -12,7 +12,7 @@ Licensed under `MIT OR Apache-2.0`. The repository contains no game data; all te
 
 ## Status
 
-**BC1, BC3, BC4, BC5 and BC7 decode in the Rust library and CLI.** The synthetic stream encoder and whole-texture DDS export support all five formats. PNG export, store scanning and the Python reference handle BC1. **BC6H** has its entropy layer solved (16 lanes in `src/format.rs`), with block rebuild not implemented yet.
+**BC1, BC3, BC4, BC5 and BC7 decode in the Rust library and CLI.** The synthetic stream encoder, whole-texture DDS export, PNG export and store scanning support all five formats. **BC6H** has its entropy layer solved (16 lanes in `src/format.rs`), with block rebuild not implemented yet.
 
 | Part | Status |
 |---|---|
@@ -64,11 +64,15 @@ cargo build --release
 bcpack decode-bc1 chunk.bin 4096 out.bc1        # chunk bytes (zero pad allowed) + block count
 bcpack decode-bc5 chunk.bin 4096 out.bc5        # decode-bc3, decode-bc4 and decode-bc7 work likewise
 bcpack symbols --format bc5 chunk.bin 4096      # one line per lane (default format: bc1)
-bcpack ttpf-export pool.ttpf 318 out.png        # mip 0 of a BC1 texture, decoded + detiled (.png or .dds)
-bcpack scan --jobs 8 --every 10 pools/*.ttpf    # convergence and speed over stores
+bcpack ttpf-export pool.ttpf 318 out.png        # mip 0 decoded + detiled to RGBA8 PNG
+bcpack scan --jobs 8 --every 10 pools/*.ttpf    # sample every 10th eligible chunk per format per store
 bcpack ttpf-export pool.ttpf 318 out.dds        # mip 0 in BC1, BC3, BC4, BC5 or BC7
 bcpack bench --format bc7 chunk.bin 4096        # single-core speed (default format: bc1)
 ```
+
+PNG export preserves sRGB RGB samples and tags the image as sRGB when the
+texture's DXGI format specifies it. BC4 is exported as grayscale and BC5 as
+red/green, with signed channels mapped from [-1, 1] to [0, 255].
 
 `--window file.json` and `--quads file.json` replace the built-in BC1 tables, so a newer fit can be tried without rebuilding. `tools/import_tables.py` converts fit outputs into the `data/` format.
 
@@ -95,7 +99,7 @@ To embed only the decoder, turn off the default features. The library then depen
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", default-features = false }
 ```
 
-Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output (`flate2`, `png`; PNG for BC1). `cli` (default) adds the `bcpack` tool on top (`rayon`).
+Features: `ttpf` adds the RDS5 store reader, Gfx10 detiling, whole-texture decode and PNG output for all five formats (`flate2`, `png`). `cli` (default) adds the `bcpack` tool on top (`rayon`).
 
 Python reference (BC1, slow, readable): `python3 -I python/bcpack.py decode-bc1 chunk.bin 4096 out.bc1`.
 
@@ -106,7 +110,8 @@ Python reference (BC1, slow, readable): `python3 -I python/bcpack.py decode-bc1 
 - `src/bc1.rs`: lane symbols to BC1 blocks (back references, preset window, quadrant codebook)
 - `src/bcn.rs`: lane symbols to BC3, BC4 and BC5 blocks (pair ranks, BC3 quadrant ranks, 255-entry dictionaries)
 - `src/bc7.rs`: lane symbols to BC7 blocks (control codes, 255-entry dictionary, BC7 block pack/unpack)
-- `src/ttpf.rs`: RDS5 stores, ETPF texture index, Gfx10 mip layout and detiling, BC1 to RGBA, DDS/PNG
+- `src/ttpf.rs`: RDS5 stores, ETPF texture index, Gfx10 mip layout and detiling, DDS/PNG writers
+- `src/pixels.rs`: BC1/BC3/BC4/BC5/BC7 blocks to RGBA8 pixels (pure Rust, no extra dependencies)
 - `src/encode.rs`: synthetic stream encoder for tests (reverse rANS per fragment, interleaved by replaying the feeder)
 - `src/tables.rs`, `python/bcpack_tables.py`: generated from `mdu_minirans.v` by `tools/gen_tables.py`
 - `data/`: built-in constant tables (`bc1_window.json`, `bc1_quad_table.json`, `bc3.json`, `bc4.json`, `bc5.json`, `bc7.json`)
@@ -119,7 +124,7 @@ cargo test --release
 python3 -I python/bcpack.py selftest
 ```
 
-The Rust tests check the Verilog table checksum, that the reciprocal inverse equals exact division for every model and cf, synthetic round trips through the encoder (random symbols, all 16 models, alphabet narrowing, 2- and 3-byte headers, multi-fragment lanes, padding, truncation), that the fast and reference decoders agree clock for clock, the block assembly on a hand-built case, and golden SHA-256 hashes of decoded synthetic output. The Python self-test decodes the same synthetic vectors (`tests/vectors/`) and must match. Synthetic tests show the decoder is self-consistent; agreement with hardware comes from the retail checks above.
+The Rust tests check the Verilog table checksum, that the reciprocal inverse equals exact division for every model and cf, synthetic round trips through the encoder (random symbols, all 16 models, alphabet narrowing, 2- and 3-byte headers, multi-fragment lanes, padding, truncation), that the fast and reference decoders agree clock for clock, the block assembly on a hand-built case, and golden SHA-256 hashes of decoded synthetic output. `tests/pixels.rs` hand-computes BC1/BC3/BC4/BC5 pixels (both BC4 palettes, SNORM, punch-through, BC3's always-opaque colour), decodes hand-built BC7 blocks for modes 0, 4 and 6 plus a flat-endpoint invariant over all 285 BC7 controls, and round-trips synthetic stores through `ttpf-export` PNG/DDS and `scan`. The Python self-test decodes the same synthetic vectors (`tests/vectors/`) and must match. Synthetic tests show the decoder is self-consistent; agreement with hardware comes from the retail checks above.
 
 ## Reproducing
 

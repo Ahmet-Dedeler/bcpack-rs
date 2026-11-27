@@ -25,7 +25,8 @@
 //! * [`format`]: mode metadata, lane widths, back-references and dictionary addressing;
 //! * [`bcn`]: lane symbols -> BC3, BC4 and BC5 blocks;
 //! * [`bc7`]: lane symbols -> BC7 blocks (plus block pack/unpack);
-//! * [`ttpf`]: RDS5 texture stores, Gfx10 detiling, DDS output and BC1 PNG output;
+//! * [`pixels`]: BC1/BC3/BC4/BC5/BC7 blocks -> RGBA8 pixels;
+//! * [`ttpf`]: RDS5 texture stores, Gfx10 detiling, DDS and PNG output;
 //! * [`encode`]: a synthetic encoder used by the tests;
 //! * [`tables`]: the exact model tables, generated from Microsoft's
 //!   MIT-licensed `silicon-rans` Verilog.
@@ -38,6 +39,7 @@ pub mod bc7;
 pub mod bcn;
 pub mod encode;
 pub mod format;
+pub mod pixels;
 pub mod rans;
 pub mod tables;
 #[cfg(feature = "ttpf")]

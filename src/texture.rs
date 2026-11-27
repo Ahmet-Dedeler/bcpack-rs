@@ -22,7 +22,7 @@ pub struct Mip0 {
     pub unfitted_blocks: usize,
 }
 
-/// DXGI formats this exporter handles (BC1_TYPELESS, BC1_UNORM, BC1_UNORM_SRGB).
+/// The BC1 DXGI formats (written as legacy DXT1 DDS, not a DX10 header).
 pub const BC1_DXGI: [u32; 3] = [70, 71, 72];
 
 /// Decode mip 0 of texture `tex` in `store`: plain chunks are inflated, BCPack

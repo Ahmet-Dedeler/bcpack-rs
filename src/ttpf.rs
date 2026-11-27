@@ -2,8 +2,8 @@
 // Source: https://github.com/Ahmet-Dedeler/bcpack-rs
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // If you copy, vendor or port this file, keep this header and credit bcpack-rs in your README.
-//! RDS5 (`.ttpf`) texture store reader, Gfx10 mip layout and detiling, BC1
-//! pixel decode, and DDS / PNG writers.
+//! RDS5 (`.ttpf`) texture store reader, Gfx10 mip layout and detiling, and DDS
+//! / PNG writers (block -> pixel decoding lives in [`crate::pixels`]).
 //!
 //! Layout as documented by the SixNG format notes and paryzius' ttpf-viewer
 //! (whose Gfx10 tiling and mip-tail code this follows):
@@ -20,6 +20,8 @@ use crate::format::Mode;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+
+pub use crate::pixels::{bc1_palette, bc1_to_rgba};
 
 pub const CODEC_STORED: u8 = 0x00;
 pub const CODEC_ZLIB: u8 = 0x20;
@@ -435,65 +437,8 @@ pub(crate) fn detile(
 }
 
 // ---------------------------------------------------------------------------
-// BC1 pixels, DDS, PNG
+// DDS and PNG writers
 // ---------------------------------------------------------------------------
-
-fn c565(c: u16) -> [u8; 3] {
-    let (r, g, b) = ((c >> 11) & 31, (c >> 5) & 63, c & 31);
-    [
-        ((r << 3) | (r >> 2)) as u8,
-        ((g << 2) | (g >> 4)) as u8,
-        ((b << 3) | (b >> 2)) as u8,
-    ]
-}
-
-/// Standard BC1 palette (RGBA): 4-colour when c0 > c1, else 3-colour + transparent black.
-pub fn bc1_palette(c0: u16, c1: u16) -> [[u8; 4]; 4] {
-    let (a, b) = (c565(c0), c565(c1));
-    let mut p = [
-        [a[0], a[1], a[2], 255],
-        [b[0], b[1], b[2], 255],
-        [0, 0, 0, 255],
-        [0, 0, 0, 0],
-    ];
-    for k in 0..3 {
-        let (x, y) = (a[k] as u32, b[k] as u32);
-        if c0 > c1 {
-            p[2][k] = ((2 * x + y + 1) / 3) as u8;
-            p[3][k] = ((x + 2 * y + 1) / 3) as u8;
-        } else {
-            p[2][k] = ((x + y) / 2) as u8;
-        }
-    }
-    if c0 > c1 {
-        p[3][3] = 255;
-    }
-    p
-}
-
-/// Row-major BC1 blocks (bw x bh) -> RGBA pixels cropped to w x h.
-pub fn bc1_to_rgba(blocks: &[u8], bw: usize, bh: usize, w: usize, h: usize) -> Vec<u8> {
-    let mut img = vec![0u8; w * h * 4];
-    for by in 0..bh {
-        for bx in 0..bw {
-            let o = (by * bw + bx) * 8;
-            let c0 = u16::from_le_bytes([blocks[o], blocks[o + 1]]);
-            let c1 = u16::from_le_bytes([blocks[o + 2], blocks[o + 3]]);
-            let idx = u32le(blocks, o + 4);
-            let pal = bc1_palette(c0, c1);
-            for py in 0..4 {
-                for pxl in 0..4 {
-                    let (x, y) = (bx * 4 + pxl, by * 4 + py);
-                    if x < w && y < h {
-                        let c = pal[((idx >> (2 * (py * 4 + pxl))) & 3) as usize];
-                        img[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&c);
-                    }
-                }
-            }
-        }
-    }
-    img
-}
 
 /// A DDS file (legacy header, FourCC DXT1) holding one BC1 level.
 pub fn dds_bc1(blocks: &[u8], w: u32, h: u32) -> Vec<u8> {
@@ -512,14 +457,7 @@ pub fn dds(blocks: &[u8], w: u32, h: u32, dxgi: u32) -> io::Result<Vec<u8>> {
 }
 
 pub(crate) fn texture_mode(dxgi: u32) -> Option<Mode> {
-    match dxgi {
-        70..=72 => Some(Mode::Bc1),
-        76..=78 => Some(Mode::Bc3),
-        79..=81 => Some(Mode::Bc4),
-        82..=84 => Some(Mode::Bc5),
-        97..=99 => Some(Mode::Bc7),
-        _ => None,
-    }
+    crate::pixels::mode_from_dxgi(dxgi).map(|(m, _)| m)
 }
 
 fn dds_header(blocks: &[u8], w: u32, h: u32, dxgi: Option<u32>) -> Vec<u8> {
@@ -563,11 +501,19 @@ fn dds_header(blocks: &[u8], w: u32, h: u32, dxgi: Option<u32>) -> Vec<u8> {
 
 /// Encode RGBA pixels as PNG.
 pub fn png_rgba(rgba: &[u8], w: u32, h: u32) -> io::Result<Vec<u8>> {
+    png_rgba_with_srgb(rgba, w, h, false)
+}
+
+/// Encode RGBA pixels as PNG, tagging sRGB samples when requested.
+pub fn png_rgba_with_srgb(rgba: &[u8], w: u32, h: u32, srgb: bool) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut out, w, h);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
+        if srgb {
+            enc.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        }
         let mut wr = enc.write_header().map_err(|e| bad(e.to_string()))?;
         wr.write_image_data(rgba).map_err(|e| bad(e.to_string()))?;
     }
